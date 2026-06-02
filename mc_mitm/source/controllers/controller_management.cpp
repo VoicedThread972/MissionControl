@@ -14,6 +14,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "controller_management.hpp"
+#include "switch2_debug.hpp"
+#include "switch2_discovery.hpp"
 #include <stratosphere.hpp>
 #include "../utils.hpp"
 
@@ -46,6 +48,30 @@ namespace ams::controller {
     }
 
     ControllerType Identify(const bluetooth::DevicesSettings *device) {
+        // Check Switch 2 controllers FIRST to avoid misidentification by name
+        for (auto hwId : JoyCon2LController::hardware_ids) {
+            if ( (device->vid == hwId.vid) && (device->pid == hwId.pid) ) {
+                return ControllerType_Switch2JoyConL;
+            }
+        }
+
+        for (auto hwId : JoyCon2RController::hardware_ids) {
+            if ( (device->vid == hwId.vid) && (device->pid == hwId.pid) ) {
+                return ControllerType_Switch2JoyConR;
+            }
+        }
+
+        for (auto hwId : ProController2Controller::hardware_ids) {
+            if ( (device->vid == hwId.vid) && (device->pid == hwId.pid) ) {
+                return ControllerType_Switch2ProController;
+            }
+        }
+
+        for (auto hwId : NSOGCController2Controller::hardware_ids) {
+            if ( (device->vid == hwId.vid) && (device->pid == hwId.pid) ) {
+                return ControllerType_Switch2NSOGCController;
+            }
+        }
 
         for (auto hwId : SwitchController::hardware_ids) {
             if ( (device->vid == hwId.vid) && (device->pid == hwId.pid) ) {
@@ -232,13 +258,16 @@ namespace ams::controller {
 
     void AttachHandler(bluetooth::Address address) {
         bluetooth::DevicesSettings device_settings;
-        R_ABORT_UNLESS(btdrvGetPairedDeviceInfo(address, &device_settings));
+        Result r = btdrvGetPairedDeviceInfo(address, &device_settings);
 
-        HardwareID id = { device_settings.vid, device_settings.pid };
+        HardwareID id = { 0, 0 };
 
         std::shared_ptr<SwitchController> controller;
 
-        switch (Identify(&device_settings)) {
+        if (R_SUCCEEDED(r)) {
+            id = { device_settings.vid, device_settings.pid };
+
+            switch (Identify(&device_settings)) {
             case ControllerType_Switch:
                 controller = std::make_shared<SwitchController>(address, id);
                 break;
@@ -320,9 +349,48 @@ namespace ams::controller {
             case ControllerType_Amazon:
                 controller = std::make_shared<AmazonController>(address, id);
                 break;
+            case ControllerType_Switch2JoyConL:
+                controller = std::make_shared<JoyCon2LController>(address, id);
+                break;
+            case ControllerType_Switch2JoyConR:
+                controller = std::make_shared<JoyCon2RController>(address, id);
+                break;
+            case ControllerType_Switch2ProController:
+                controller = std::make_shared<ProController2Controller>(address, id);
+                break;
+            case ControllerType_Switch2NSOGCController:
+                controller = std::make_shared<NSOGCController2Controller>(address, id);
+                break;
             default:
                 controller = std::make_shared<UnknownController>(address, id);
                 break;
+            }
+        } else {
+            // Paired device info is not available. This is expected for Switch 2
+            // controllers, which connect over BLE and may not have classic paired
+            // device settings. If the BLE discovery layer has identified the address
+            // as a known Switch 2 controller, attach the matching handler. Otherwise
+            // fall back to a passthrough UnknownController (matching the master
+            // default for unidentified devices) rather than guessing a Switch handler.
+            SW2_LOG_WARN("Paired device info unavailable for incoming connection; checking Switch 2 discovery map");
+            ControllerType sw2_type = GetDiscoveredSwitch2ControllerType(address);
+            switch (sw2_type) {
+                case ControllerType_Switch2JoyConL:
+                    controller = std::make_shared<JoyCon2LController>(address, id);
+                    break;
+                case ControllerType_Switch2JoyConR:
+                    controller = std::make_shared<JoyCon2RController>(address, id);
+                    break;
+                case ControllerType_Switch2ProController:
+                    controller = std::make_shared<ProController2Controller>(address, id);
+                    break;
+                case ControllerType_Switch2NSOGCController:
+                    controller = std::make_shared<NSOGCController2Controller>(address, id);
+                    break;
+                default:
+                    controller = std::make_shared<UnknownController>(address, id);
+                    break;
+            }
         }
 
         {

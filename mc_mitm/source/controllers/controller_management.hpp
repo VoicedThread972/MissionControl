@@ -44,6 +44,7 @@
 #include "atari_controller.hpp"
 #include "bionik_controller.hpp"
 #include "amazon_controller.hpp"
+#include "switch2_controller.hpp"
 
 namespace ams::controller {
 
@@ -79,6 +80,10 @@ namespace ams::controller {
         ControllerType_Atari,
         ControllerType_Bionik,
         ControllerType_Amazon,
+        ControllerType_Switch2JoyConL,
+        ControllerType_Switch2JoyConR,
+        ControllerType_Switch2ProController,
+        ControllerType_Switch2NSOGCController,
         ControllerType_Unknown,
     };
 

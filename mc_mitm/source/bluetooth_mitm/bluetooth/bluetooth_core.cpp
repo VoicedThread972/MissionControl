@@ -17,6 +17,7 @@
 #include "../btdrv_ext.h"
 #include "../btdrv_mitm_flags.hpp"
 #include "../../controllers/controller_management.hpp"
+#include "../../controllers/switch2_debug.hpp"
 #include "../../utils.hpp"
 
 namespace ams::bluetooth::core {
@@ -192,6 +193,8 @@ namespace ams::bluetooth::core {
             std::scoped_lock lk(g_event_info_lock);
             R_ABORT_UNLESS(btdrvGetEventInfo(&g_event_info, sizeof(bluetooth::EventInfo), &g_current_event_type));
         }
+
+        SW2_LOG_INFO("Core Event: type=%u", (u32)g_current_event_type);
 
         // Process custom event and return
         if (g_current_event_type == BtdrvEventType_MissionControlCustomEvent) {

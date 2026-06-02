@@ -18,6 +18,7 @@
 #include "../btdrv_shim.h"
 #include "../btdrv_mitm_flags.hpp"
 #include "../../controllers/controller_management.hpp"
+#include "../../controllers/switch2_debug.hpp"
 
 namespace ams::bluetooth::hid::report {
 
@@ -352,6 +353,7 @@ namespace ams::bluetooth::hid::report {
     }
 
     void HandleEvent() {
+        SW2_LOG_VERBOSE("HID Report Event triggered");
         if (g_redirect_hid_report_events) {
             g_system_event_user_fwd.Signal();
             g_report_read_event.Wait();

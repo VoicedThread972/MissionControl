@@ -28,6 +28,7 @@
 #include "bluetooth_mitm/bluetooth/bluetooth_hid_report.hpp"
 #include "bluetooth_mitm/bluetooth/bluetooth_ble.hpp"
 #include "usb/mc_usb_handler.hpp"
+#include "controllers/switch2_debug.hpp"
 
 namespace ams::mitm {
 

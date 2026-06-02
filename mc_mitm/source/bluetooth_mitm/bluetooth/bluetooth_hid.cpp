@@ -16,6 +16,7 @@
 #include "bluetooth_hid.hpp"
 #include "../btdrv_mitm_flags.hpp"
 #include "../../controllers/controller_management.hpp"
+#include "../../controllers/switch2_debug.hpp"
 
 namespace ams::bluetooth::hid {
 
@@ -72,7 +73,7 @@ namespace ams::bluetooth::hid {
         std::memcpy(buffer, &g_event_info, size);
 
         g_data_read_event.Signal();
-
+        
         R_SUCCEED();
     }
 
@@ -107,6 +108,8 @@ namespace ams::bluetooth::hid {
             std::scoped_lock lk(g_event_info_lock);
             R_ABORT_UNLESS(btdrvGetHidEventInfo(&g_event_info, sizeof(bluetooth::HidEventInfo), &g_current_event_type));
         }
+
+        SW2_LOG_INFO("HID Event: type=%u", (u32)g_current_event_type);
 
         switch (g_current_event_type) {
             case BtdrvHidEventType_Connection:
