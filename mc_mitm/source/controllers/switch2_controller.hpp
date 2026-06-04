@@ -19,11 +19,10 @@
 namespace ams::controller {
 
     /*
-     * All Switch 2 controllers (Joy-Con 2 L/R, Pro Controller 2, NSO GameCube)
-     * expose a single universal input report, id 0x05, over their BLE input
-     * characteristic (UUID ab7de9be-89fe-49ad-828f-118f09df7fd2). When delivered
-     * over BLE the leading report-id byte is omitted, so byte 0 of the payload is
-     * the first field of the report (a free-running counter).
+     * Switch 2 controllers expose a universal input report, id 0x05, plus a
+     * controller-specific default report over BLE (0x07/0x08/0x09/0x0A). BLE
+     * notifications omit the leading report-id byte, so byte 0 of the payload is
+     * the first field of the selected report.
      *
      * This layout, the button bit ordering and the 12-bit stick packing are taken
      * directly from the canonical joycon2cpp reference implementation and confirmed
@@ -79,15 +78,18 @@ namespace ams::controller {
         u8                right_stick[3];   // 0x0D 12-bit packed (x, y)
     } PACKED;
 
-    // Absolute payload offsets for fields not covered by the leading struct.
-    enum Switch2InputOffset {
-        Switch2InputOffset_BatteryVoltage = 0x1F,   // u16, little-endian, millivolts
-        Switch2InputOffset_TriggerL       = 0x3C,   // u8, analog (GameCube controller only)
-        Switch2InputOffset_TriggerR       = 0x3D,   // u8, analog (GameCube controller only)
+    // Absolute payload offsets for report 0x05 fields not covered by the struct.
+    enum Switch2InputReport0x05Offset {
+        Switch2InputReport0x05Offset_BatteryVoltage = 0x1F,   // u16, little-endian, millivolts
+        Switch2InputReport0x05Offset_TriggerL       = 0x3C,   // u8, analog (GameCube controller only)
+        Switch2InputReport0x05Offset_TriggerR       = 0x3D,   // u8, analog (GameCube controller only)
     };
 
-    // Minimum payload length required to safely read the stick fields.
-    constexpr size_t Switch2InputReportMinLength = sizeof(Switch2InputReport0x05);
+    constexpr size_t Switch2InputReport0x05MinLength = sizeof(Switch2InputReport0x05);
+    constexpr size_t Switch2InputReport0x07MinLength = 0x08; // Joy-Con 2 L: through stick
+    constexpr size_t Switch2InputReport0x08MinLength = 0x08; // Joy-Con 2 R: through stick
+    constexpr size_t Switch2InputReport0x09MinLength = 0x0B; // Pro Controller 2: through sticks
+    constexpr size_t Switch2InputReport0x0AMinLength = 0x0E; // NSO GC: through analog triggers
 
     // Analog-trigger threshold above which a GameCube ZL/ZR is treated as pressed.
     constexpr u8 Switch2TriggerThreshold = 30;
@@ -106,9 +108,15 @@ namespace ams::controller {
             // command characteristic (UUID 649d4ac9-8eb7-4e6c-af44-1ea54fe5f005).
             void MakeSwitch2Command(bluetooth::HidReport *report, u8 cmd_id, u8 sub_id, const u8 *data, u8 data_len);
 
-            // Maps the universal report 0x05 button/stick/battery state onto the
-            // emulated Switch controller. Shared by every Switch 2 controller type.
+            u8 GetFeatureMask() const;
+            void ResetSwitch2StateForReport();
+            void ApplyPowerInfo(u8 power_info);
+
             void MapInputReport0x05(const bluetooth::HidReport *report);
+            void MapInputReport0x07(const bluetooth::HidReport *report);
+            void MapInputReport0x08(const bluetooth::HidReport *report);
+            void MapInputReport0x09(const bluetooth::HidReport *report);
+            void MapInputReport0x0A(const bluetooth::HidReport *report);
 
             static u16 Unpack12BitStickX(const u8 *data) {
                 return static_cast<u16>(((data[1] & 0x0F) << 8) | data[0]);

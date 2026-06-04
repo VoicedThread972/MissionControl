@@ -23,29 +23,64 @@ namespace ams::controller {
     namespace {
 
         constexpr const char *LogPath = "sdmc:/config/MissionControl/switch2_debug.log";
-        constexpr size_t      LogBufSize = 4096;
+        constexpr const char *BuildSignature = __DATE__ " " __TIME__;
 
-        os::SdkMutex  g_log_mutex;
-        fs::FileHandle g_log_file;
-        bool           g_log_open    = false;
+        os::SdkMutex   g_log_mutex;
+        bool           g_initialized = false;
         Switch2LogLevel g_log_level  = Switch2LogLevel::Verbose;
+        u64            g_log_sequence = 0;
 
-        // Write raw bytes to the open log file, ignoring errors
+        Result EnsureLogFileExists() {
+            R_TRY_CATCH(fs::CreateFile(LogPath, 0)) {
+                R_CONVERT(fs::ResultPathAlreadyExists, ResultSuccess());
+            } R_END_TRY_CATCH;
+
+            R_SUCCEED();
+        }
+
+        // Write raw bytes to the log file with a short-lived handle so SD tools
+        // can inspect/copy/delete the log while the sysmodule is still running.
         void WriteRaw(const char *buf, size_t len) {
-            if (!g_log_open || len == 0) return;
+            if (!g_initialized || len == 0) return;
+
+            if (R_FAILED(EnsureLogFileExists())) return;
+
+            fs::FileHandle file;
+            if (R_FAILED(fs::OpenFile(std::addressof(file), LogPath, fs::OpenMode_Write | fs::OpenMode_AllowAppend))) return;
+            ON_SCOPE_EXIT { fs::CloseFile(file); };
+
             s64 offset = 0;
-            // Seek to end
-            if (R_FAILED(fs::GetFileSize(std::addressof(offset), g_log_file))) return;
-            // Extend file if needed
-            fs::SetFileSize(g_log_file, offset + static_cast<s64>(len));
-            fs::WriteFile(g_log_file, offset, buf, len, fs::WriteOption::None);
-            fs::FlushFile(g_log_file);
+            if (R_FAILED(fs::GetFileSize(std::addressof(offset), file))) return;
+
+            static_cast<void>(fs::WriteFile(file, offset, buf, len, fs::WriteOption::Flush));
         }
 
         void FormatAddress(char *buf, size_t bufsz, const bluetooth::Address &addr) {
             std::snprintf(buf, bufsz, "%02X:%02X:%02X:%02X:%02X:%02X",
                 addr.address[0], addr.address[1], addr.address[2],
                 addr.address[3], addr.address[4], addr.address[5]);
+        }
+
+        void WriteSessionHeader() {
+            // Keep header formatting stack usage small: the init thread runs with
+            // a 0x1000-byte stack and large local buffers can overflow it.
+            char header[256];
+            const u64 session_tick = os::GetSystemTick().GetInt64Value();
+
+            int len = std::snprintf(
+                header,
+                sizeof(header),
+                "=== Switch2 Debug Log ===\n"
+                "Build Signature: %s\n"
+                "Session Start Tick: %016llX\n"
+                "Log Format Version: 2\n",
+                BuildSignature,
+                static_cast<unsigned long long>(session_tick)
+            );
+
+            if (len > 0) {
+                WriteRaw(header, static_cast<size_t>(len));
+            }
         }
 
     }
@@ -55,24 +90,20 @@ namespace ams::controller {
         g_log_level = level;
 
         // Ensure directory exists
-        fs::EnsureDirectory("sdmc:/config/MissionControl");
+        if (R_FAILED(fs::EnsureDirectory("sdmc:/config/MissionControl"))) return;
 
         // Delete old log and create fresh
-        fs::DeleteFile(LogPath);
+        static_cast<void>(fs::DeleteFile(LogPath));
         if (R_FAILED(fs::CreateFile(LogPath, 0))) return;
-        if (R_FAILED(fs::OpenFile(std::addressof(g_log_file), LogPath, fs::OpenMode_ReadWrite | fs::OpenMode_AllowAppend))) return;
-        g_log_open = true;
+        g_initialized = true;
+        g_log_sequence = 0;
 
-        const char *header = "=== Switch2 Debug Log ===\n";
-        WriteRaw(header, std::strlen(header));
+        WriteSessionHeader();
     }
 
     void Switch2DebugFini() {
         std::scoped_lock lk(g_log_mutex);
-        if (g_log_open) {
-            fs::CloseFile(g_log_file);
-            g_log_open = false;
-        }
+        g_initialized = false;
     }
 
     void Switch2DebugLog(Switch2LogLevel level, const char *fmt, ...) {
@@ -80,6 +111,7 @@ namespace ams::controller {
 
         char buf[512];
         u64 tick = os::GetSystemTick().GetInt64Value();
+        ++g_log_sequence;
 
         // Format the user message
         char msg[400];
@@ -88,7 +120,14 @@ namespace ams::controller {
         std::vsnprintf(msg, sizeof(msg), fmt, args);
         va_end(args);
 
-        int len = std::snprintf(buf, sizeof(buf), "[%016llX] %s\n", (unsigned long long)tick, msg);
+        int len = std::snprintf(
+            buf,
+            sizeof(buf),
+            "[#%06llu][%016llX] %s\n",
+            static_cast<unsigned long long>(g_log_sequence),
+            static_cast<unsigned long long>(tick),
+            msg
+        );
         if (len <= 0) return;
 
         std::scoped_lock lk(g_log_mutex);
@@ -103,6 +142,7 @@ namespace ams::controller {
         FormatAddress(addrStr, sizeof(addrStr), addr);
 
         u64 tick = os::GetSystemTick().GetInt64Value();
+        ++g_log_sequence;
 
         // Build hex string (cap at 64 bytes to keep log manageable)
         char hexbuf[256];
@@ -116,8 +156,9 @@ namespace ams::controller {
         }
 
         char line[512];
-        int len = std::snprintf(line, sizeof(line), "[%016llX] [%s %s] %s\n",
-            (unsigned long long)tick,
+        int len = std::snprintf(line, sizeof(line), "[#%06llu][%016llX] [%s %s] %s\n",
+            static_cast<unsigned long long>(g_log_sequence),
+            static_cast<unsigned long long>(tick),
             dir == PacketDirection::In ? "IN " : "OUT",
             addrStr, hexbuf);
         if (len <= 0) return;

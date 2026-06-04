@@ -67,20 +67,31 @@ namespace ams::mitm {
         }
 
         void InitializeThreadFunc(void *) {
+            // Initialize Switch 2 debug logging early so startup/event diagnostics
+            // are available on SD for field testing.
+            ams::controller::Switch2DebugInit(ams::controller::Switch2LogLevel::Verbose);
+            SW2_LOG_INFO("InitThread start (build=%s)", __DATE__ " " __TIME__);
+
             // Start async worker thread(s)
-            ams::async::Initialize();
+            R_ABORT_UNLESS(ams::async::Initialize());
+            SW2_LOG_INFO("Async worker initialized");
 
             // Start bluetooth event handling thread
-            ams::bluetooth::events::Initialize();
+            R_ABORT_UNLESS(ams::bluetooth::events::Initialize());
+            SW2_LOG_INFO("Bluetooth event thread initialized");
 
             // Start hid report handling thread
-            ams::bluetooth::hid::report::Initialize();
+            R_ABORT_UNLESS(ams::bluetooth::hid::report::Initialize());
+            SW2_LOG_INFO("HID report thread initialized");
 
             // Wait for system to call BluetoothEnable
+            SW2_LOG_INFO("Waiting for BluetoothEnable");
             ams::bluetooth::core::WaitEnabled();
+            SW2_LOG_INFO("BluetoothEnable observed");
 
             // Connect to btdrv service now that we're sure the mitm is up and running
             R_ABORT_UNLESS(btdrvInitialize());
+            SW2_LOG_INFO("btdrvInitialize succeeded");
 
             // Get global module settings
             auto config = GetGlobalConfig();
@@ -89,13 +100,24 @@ namespace ams::mitm {
             ams::bluetooth::Address null_address = {};
             if (std::memcmp(&config->bluetooth.host_address, &null_address, sizeof(ams::bluetooth::Address)) != 0) {
                 R_ABORT_UNLESS(OverrideHostAddress(&config->bluetooth.host_address));
+                SW2_LOG_INFO(
+                    "Applied host address override: %02X:%02X:%02X:%02X:%02X:%02X",
+                    config->bluetooth.host_address.address[0],
+                    config->bluetooth.host_address.address[1],
+                    config->bluetooth.host_address.address[2],
+                    config->bluetooth.host_address.address[3],
+                    config->bluetooth.host_address.address[4],
+                    config->bluetooth.host_address.address[5]
+                );
             }
 
             // Set bluetooth adapter host name override
             if (std::strlen(config->bluetooth.host_name) > 0) {
                 R_ABORT_UNLESS(OverrideHostName(config->bluetooth.host_name));
+                SW2_LOG_INFO("Applied host name override: %s", config->bluetooth.host_name);
             }
 
+            SW2_LOG_INFO("InitThread complete");
             g_init_event.Signal();
         }
 
@@ -139,6 +161,8 @@ namespace ams::mitm {
         ams::mc::WaitFinished();
         ams::mitm::btm::WaitFinished();
         ams::mitm::bluetooth::WaitFinished();
+
+        ams::controller::Switch2DebugFini();
     }
 
     void WaitInitialized() {

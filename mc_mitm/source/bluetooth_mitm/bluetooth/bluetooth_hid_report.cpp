@@ -19,6 +19,7 @@
 #include "../btdrv_mitm_flags.hpp"
 #include "../../controllers/controller_management.hpp"
 #include "../../controllers/switch2_debug.hpp"
+#include <cstdio>
 
 namespace ams::bluetooth::hid::report {
 
@@ -51,6 +52,16 @@ namespace ams::bluetooth::hid::report {
         bluetooth::CircularBuffer *g_fake_buffer;
 
         constinit bluetooth::HidReportEventInfo g_fake_report_event_info;
+
+        void FormatAddress(char *buf, size_t bufsz, const bluetooth::Address &addr) {
+            std::snprintf(
+                buf,
+                bufsz,
+                "%02X:%02X:%02X:%02X:%02X:%02X",
+                addr.address[0], addr.address[1], addr.address[2],
+                addr.address[3], addr.address[4], addr.address[5]
+            );
+        }
 
         void EventThreadFunc(void *) {
 
@@ -160,7 +171,16 @@ namespace ams::bluetooth::hid::report {
             std::memcpy(&g_fake_report_event_info.data_report.v7.report, report, report->size + sizeof(report->size));
         }
 
-        g_fake_buffer->Write(hos::GetVersion() >= hos::Version_12_0_0 ? BtdrvHidEventType_Data : BtdrvHidEventTypeOld_Data, &g_fake_report_event_info, report->size + 0x11);
+        const Result rc = g_fake_buffer->Write(
+            hos::GetVersion() >= hos::Version_12_0_0 ? BtdrvHidEventType_Data : BtdrvHidEventTypeOld_Data,
+            &g_fake_report_event_info,
+            report->size + 0x11
+        );
+        if (R_FAILED(rc)) {
+            SW2_LOG_WARN("WriteHidDataReport: fake buffer write failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+            R_RETURN(rc);
+        }
+
         g_system_event_fwd.Signal();
 
         R_SUCCEED();
@@ -170,7 +190,16 @@ namespace ams::bluetooth::hid::report {
         g_fake_report_event_info.set_report.addr = address;
         g_fake_report_event_info.set_report.res = status;
 
-        g_fake_buffer->Write(hos::GetVersion() >= hos::Version_12_0_0 ? BtdrvHidEventType_Data : BtdrvHidEventTypeOld_Data, &g_fake_report_event_info, sizeof(g_fake_report_event_info.set_report));
+        const Result rc = g_fake_buffer->Write(
+            hos::GetVersion() >= hos::Version_12_0_0 ? BtdrvHidEventType_Data : BtdrvHidEventTypeOld_Data,
+            &g_fake_report_event_info,
+            sizeof(g_fake_report_event_info.set_report)
+        );
+        if (R_FAILED(rc)) {
+            SW2_LOG_WARN("WriteHidSetReport: fake buffer write failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+            R_RETURN(rc);
+        }
+
         g_system_event_fwd.Signal();
 
         R_SUCCEED();
@@ -187,7 +216,16 @@ namespace ams::bluetooth::hid::report {
             std::memcpy(&g_fake_report_event_info.get_report.v1.report, report, report->size + sizeof(report->size));
         }
 
-        g_fake_buffer->Write(hos::GetVersion() >= hos::Version_12_0_0 ? BtdrvHidEventType_GetReport : BtdrvHidEventTypeOld_GetReport, &g_fake_report_event_info, report->size + 0x11);
+        const Result rc = g_fake_buffer->Write(
+            hos::GetVersion() >= hos::Version_12_0_0 ? BtdrvHidEventType_GetReport : BtdrvHidEventTypeOld_GetReport,
+            &g_fake_report_event_info,
+            report->size + 0x11
+        );
+        if (R_FAILED(rc)) {
+            SW2_LOG_WARN("WriteHidGetReport: fake buffer write failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+            R_RETURN(rc);
+        }
+
         g_system_event_fwd.Signal();
 
         R_SUCCEED();
@@ -203,7 +241,7 @@ namespace ams::bluetooth::hid::report {
                 return -1;
             }
 
-            g_fake_buffer->Free();
+            static_cast<void>(g_fake_buffer->Free());
 
             auto event_info = reinterpret_cast<bluetooth::HidReportEventInfo *>(buffer);
             *type = static_cast<bluetooth::HidEventType>(packet->header.type);
@@ -241,25 +279,49 @@ namespace ams::bluetooth::hid::report {
         switch (g_current_event_type) {
             case BtdrvHidEventTypeOld_Data:
                 {
-                    auto device = controller::LocateHandler(g_event_info.data_report.v1.addr);
+                    const bluetooth::Address addr = g_event_info.data_report.v1.addr;
+                    auto device = controller::LocateHandler(addr);
                     if (device) {
-                        device->HandleDataReportEvent(&g_event_info);
+                        const Result rc = device->HandleDataReportEvent(&g_event_info);
+                        if (R_FAILED(rc)) {
+                            SW2_LOG_WARN("HID report (v1) data dispatch failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+                        }
+                    } else {
+                        char addr_str[20];
+                        FormatAddress(addr_str, sizeof(addr_str), addr);
+                        SW2_LOG_VERBOSE("HID report (v1) data for unmapped addr=%s", addr_str);
                     }
                 }
                 break;
             case BtdrvHidEventTypeOld_SetReport:
                 {
-                    auto device = controller::LocateHandler(g_event_info.set_report.addr);
+                    const bluetooth::Address addr = g_event_info.set_report.addr;
+                    auto device = controller::LocateHandler(addr);
                     if (device) {
-                        device->HandleSetReportEvent(&g_event_info);
+                        const Result rc = device->HandleSetReportEvent(&g_event_info);
+                        if (R_FAILED(rc)) {
+                            SW2_LOG_WARN("HID report (v1) set-report dispatch failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+                        }
+                    } else {
+                        char addr_str[20];
+                        FormatAddress(addr_str, sizeof(addr_str), addr);
+                        SW2_LOG_VERBOSE("HID report (v1) set-report for unmapped addr=%s", addr_str);
                     }
                 }
                 break;
             case BtdrvHidEventTypeOld_GetReport:
                 {
-                    auto device = controller::LocateHandler(g_event_info.get_report.v1.addr);
+                    const bluetooth::Address addr = g_event_info.get_report.v1.addr;
+                    auto device = controller::LocateHandler(addr);
                     if (device) {
-                        device->HandleGetReportEvent(&g_event_info);
+                        const Result rc = device->HandleGetReportEvent(&g_event_info);
+                        if (R_FAILED(rc)) {
+                            SW2_LOG_WARN("HID report (v1) get-report dispatch failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+                        }
+                    } else {
+                        char addr_str[20];
+                        FormatAddress(addr_str, sizeof(addr_str), addr);
+                        SW2_LOG_VERBOSE("HID report (v1) get-report for unmapped addr=%s", addr_str);
                     }
                 }
                 break;
@@ -275,32 +337,56 @@ namespace ams::bluetooth::hid::report {
                 break;
             }
 
-            g_real_buffer->Free();
+            static_cast<void>(g_real_buffer->Free());
 
             switch (real_packet->header.type) {
                 case 0xff:
                     continue;
                 case BtdrvHidEventTypeOld_Data:
                     {
-                        auto device = controller::LocateHandler(hos::GetVersion() < hos::Version_9_0_0 ? real_packet->data.data_report.v7.addr : real_packet->data.data_report.v9.addr);
+                        const bluetooth::Address addr = hos::GetVersion() < hos::Version_9_0_0 ? real_packet->data.data_report.v7.addr : real_packet->data.data_report.v9.addr;
+                        auto device = controller::LocateHandler(addr);
                         if (device) {
-                            device->HandleDataReportEvent(&real_packet->data);
+                            const Result rc = device->HandleDataReportEvent(&real_packet->data);
+                            if (R_FAILED(rc)) {
+                                SW2_LOG_WARN("HID report (v7) data dispatch failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+                            }
+                        } else {
+                            char addr_str[20];
+                            FormatAddress(addr_str, sizeof(addr_str), addr);
+                            SW2_LOG_VERBOSE("HID report (v7) data for unmapped addr=%s", addr_str);
                         }
                     }
                     break;
                 case BtdrvHidEventTypeOld_SetReport:
                     {
-                        auto device = controller::LocateHandler(real_packet->data.set_report.addr);
+                        const bluetooth::Address addr = real_packet->data.set_report.addr;
+                        auto device = controller::LocateHandler(addr);
                         if (device) {
-                            device->HandleSetReportEvent(&real_packet->data);
+                            const Result rc = device->HandleSetReportEvent(&real_packet->data);
+                            if (R_FAILED(rc)) {
+                                SW2_LOG_WARN("HID report (v7) set-report dispatch failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+                            }
+                        } else {
+                            char addr_str[20];
+                            FormatAddress(addr_str, sizeof(addr_str), addr);
+                            SW2_LOG_VERBOSE("HID report (v7) set-report for unmapped addr=%s", addr_str);
                         }
                     }
                     break;
                 case BtdrvHidEventTypeOld_GetReport:
                     {
-                        auto device = controller::LocateHandler(real_packet->data.get_report.v1.addr);
+                        const bluetooth::Address addr = real_packet->data.get_report.v1.addr;
+                        auto device = controller::LocateHandler(addr);
                         if (device) {
-                            device->HandleGetReportEvent(&real_packet->data);
+                            const Result rc = device->HandleGetReportEvent(&real_packet->data);
+                            if (R_FAILED(rc)) {
+                                SW2_LOG_WARN("HID report (v7) get-report dispatch failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+                            }
+                        } else {
+                            char addr_str[20];
+                            FormatAddress(addr_str, sizeof(addr_str), addr);
+                            SW2_LOG_VERBOSE("HID report (v7) get-report for unmapped addr=%s", addr_str);
                         }
                     }
                     break;
@@ -317,32 +403,56 @@ namespace ams::bluetooth::hid::report {
                 break;
             }
 
-            g_real_buffer->Free();
+            static_cast<void>(g_real_buffer->Free());
 
             switch (real_packet->header.type) {
                 case 0xff:
                     continue;
                 case BtdrvHidEventType_Data:
                     {
-                        auto device = controller::LocateHandler(real_packet->data.data_report.v9.addr);
+                        const bluetooth::Address addr = real_packet->data.data_report.v9.addr;
+                        auto device = controller::LocateHandler(addr);
                         if (device) {
-                            device->HandleDataReportEvent(&real_packet->data);
+                            const Result rc = device->HandleDataReportEvent(&real_packet->data);
+                            if (R_FAILED(rc)) {
+                                SW2_LOG_WARN("HID report (v12) data dispatch failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+                            }
+                        } else {
+                            char addr_str[20];
+                            FormatAddress(addr_str, sizeof(addr_str), addr);
+                            SW2_LOG_VERBOSE("HID report (v12) data for unmapped addr=%s", addr_str);
                         }
                     }
                     break;
                 case BtdrvHidEventType_SetReport:
                     {
-                        auto device = controller::LocateHandler(real_packet->data.set_report.addr);
+                        const bluetooth::Address addr = real_packet->data.set_report.addr;
+                        auto device = controller::LocateHandler(addr);
                         if (device) {
-                            device->HandleSetReportEvent(&real_packet->data);
+                            const Result rc = device->HandleSetReportEvent(&real_packet->data);
+                            if (R_FAILED(rc)) {
+                                SW2_LOG_WARN("HID report (v12) set-report dispatch failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+                            }
+                        } else {
+                            char addr_str[20];
+                            FormatAddress(addr_str, sizeof(addr_str), addr);
+                            SW2_LOG_VERBOSE("HID report (v12) set-report for unmapped addr=%s", addr_str);
                         }
                     }
                     break;
                 case BtdrvHidEventType_GetReport:
                     {
-                        auto device = controller::LocateHandler(real_packet->data.get_report.v9.addr);
+                        const bluetooth::Address addr = real_packet->data.get_report.v9.addr;
+                        auto device = controller::LocateHandler(addr);
                         if (device) {
-                            device->HandleGetReportEvent(&real_packet->data);
+                            const Result rc = device->HandleGetReportEvent(&real_packet->data);
+                            if (R_FAILED(rc)) {
+                                SW2_LOG_WARN("HID report (v12) get-report dispatch failed rc=0x%08X", static_cast<u32>(rc.GetValue()));
+                            }
+                        } else {
+                            char addr_str[20];
+                            FormatAddress(addr_str, sizeof(addr_str), addr);
+                            SW2_LOG_VERBOSE("HID report (v12) get-report for unmapped addr=%s", addr_str);
                         }
                     }
                     break;
@@ -353,7 +463,6 @@ namespace ams::bluetooth::hid::report {
     }
 
     void HandleEvent() {
-        SW2_LOG_VERBOSE("HID Report Event triggered");
         if (g_redirect_hid_report_events) {
             g_system_event_user_fwd.Signal();
             g_report_read_event.Wait();

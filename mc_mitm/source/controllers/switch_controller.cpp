@@ -15,6 +15,8 @@
  */
 #include "switch_controller.hpp"
 #include "../mcmitm_config.hpp"
+#include "../bluetooth_mitm/bluetooth/bluetooth_ble.hpp"
+#include "switch2_debug.hpp"
 #include <string>
 
 namespace ams::controller {
@@ -130,7 +132,20 @@ namespace ams::controller {
     }
 
     Result SwitchController::WriteDataReport(const bluetooth::HidReport *report) {
-        R_RETURN(btdrvWriteHidData(m_address, report));
+        u32 conn_id = 0;
+        if (bluetooth::ble::HasSwitch2GattConnection(m_address, &conn_id)) {
+            const Result rc = bluetooth::ble::WriteSwitch2GattDataReport(m_address, report);
+            if (R_FAILED(rc)) {
+                SW2_LOG_WARN("WriteDataReport BLE path failed rc=0x%08X size=%u", static_cast<u32>(rc.GetValue()), report->size);
+            }
+            R_RETURN(rc);
+        }
+
+        const Result rc = btdrvWriteHidData(m_address, report);
+        if (R_FAILED(rc)) {
+            SW2_LOG_WARN("WriteDataReport HID path failed rc=0x%08X size=%u", static_cast<u32>(rc.GetValue()), report->size);
+        }
+        R_RETURN(rc);
     }
 
     Result SwitchController::WriteDataReport(const bluetooth::HidReport *report, u8 response_id, bluetooth::HidReport *out_report) {       

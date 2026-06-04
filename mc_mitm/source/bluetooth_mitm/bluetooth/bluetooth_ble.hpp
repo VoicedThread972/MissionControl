@@ -31,4 +31,7 @@ namespace ams::bluetooth::ble {
     Result GetEventInfo(bluetooth::BleEventType *type, void *buffer, size_t size);
     void HandleEvent();
 
+    bool HasSwitch2GattConnection(const bluetooth::Address &address, u32 *out_conn_id);
+    Result WriteSwitch2GattDataReport(const bluetooth::Address &address, const bluetooth::HidReport *report);
+
 }

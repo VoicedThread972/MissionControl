@@ -37,6 +37,95 @@ namespace ams::bluetooth::core {
         os::Event g_custom_data_event(os::EventClearMode_AutoClear);
         os::Event g_data_read_event(os::EventClearMode_AutoClear);
 
+        void FormatAddress(char *buf, size_t bufsz, const bluetooth::Address &addr) {
+            util::SNPrintf(
+                buf,
+                bufsz,
+                "%02X:%02X:%02X:%02X:%02X:%02X",
+                addr.address[0], addr.address[1], addr.address[2],
+                addr.address[3], addr.address[4], addr.address[5]
+            );
+        }
+
+        const char *GetCoreEventTypeName(const bluetooth::EventType type) {
+            if (static_cast<u32>(type) == BtdrvEventType_MissionControlCustomEvent) {
+                return "MissionControlCustomEvent";
+            }
+
+            switch (type) {
+                case BtdrvEventType_InquiryDevice:         return "InquiryDevice";
+                case BtdrvEventType_InquiryStatus:         return "InquiryStatus";
+                case BtdrvEventType_PairingPinCodeRequest: return "PairingPinCodeRequest";
+                case BtdrvEventType_SspRequest:            return "SspRequest";
+                case BtdrvEventType_Connection:            return "Connection";
+                case BtdrvEventType_Tsi:
+                    return "Tsi";
+                case BtdrvEventType_BurstMode:
+                    return "BurstMode";
+                case BtdrvEventType_SetZeroRetransmission:
+                    return "SetZeroRetransmission";
+                case BtdrvEventType_PendingConnections:
+                    return "PendingConnections";
+                case BtdrvEventType_MoveToSecondaryPiconet:
+                    return "MoveToSecondaryPiconet";
+                case BtdrvEventType_BluetoothCrash:
+                    return "BluetoothCrash";
+                default:
+                    return "Unknown";
+            }
+        }
+
+        void LogCoreEventSummary(const bluetooth::EventType type, const bluetooth::EventInfo &info) {
+            switch (type) {
+                case BtdrvEventType_PairingPinCodeRequest:
+                {
+                    char addr_str[20];
+                    FormatAddress(addr_str, sizeof(addr_str), info.pairing_pin_code_request.addr);
+                    SW2_LOG_INFO("Core PairingPinCodeRequest: addr=%s", addr_str);
+                    break;
+                }
+                case BtdrvEventType_SspRequest:
+                {
+                    char addr_str[20];
+                    if (hos::GetVersion() >= hos::Version_12_0_0) {
+                        FormatAddress(addr_str, sizeof(addr_str), info.ssp_request.v12.addr);
+                        SW2_LOG_INFO("Core SspRequest: addr=%s passkey=%d", addr_str, info.ssp_request.v12.passkey);
+                    } else {
+                        FormatAddress(addr_str, sizeof(addr_str), info.ssp_request.v1.addr);
+                        SW2_LOG_INFO("Core SspRequest: addr=%s type=%u passkey=%d", addr_str, info.ssp_request.v1.type, info.ssp_request.v1.passkey);
+                    }
+                    break;
+                }
+                case BtdrvEventType_Connection:
+                {
+                    char addr_str[20];
+                    if (hos::GetVersion() >= hos::Version_12_0_0) {
+                        FormatAddress(addr_str, sizeof(addr_str), info.connection.v12.addr);
+                        SW2_LOG_INFO("Core Connection: type=%u addr=%s", info.connection.v12.type, addr_str);
+                    } else if (hos::GetVersion() >= hos::Version_9_0_0) {
+                        FormatAddress(addr_str, sizeof(addr_str), info.connection.v9.addr);
+                        SW2_LOG_INFO("Core Connection: type=%u status=%u addr=%s", info.connection.v9.type, info.connection.v9.status, addr_str);
+                    } else {
+                        FormatAddress(addr_str, sizeof(addr_str), info.connection.v1.addr);
+                        SW2_LOG_INFO("Core Connection: type=%u status=%u addr=%s", info.connection.v1.type, info.connection.v1.status, addr_str);
+                    }
+                    break;
+                }
+                case BtdrvEventType_InquiryStatus:
+                    if (hos::GetVersion() >= hos::Version_12_0_0) {
+                        SW2_LOG_VERBOSE("Core InquiryStatus: status=%u service_mask=0x%08X", info.inquiry_status.v12.status, info.inquiry_status.v12.service_mask);
+                    } else {
+                        SW2_LOG_VERBOSE("Core InquiryStatus: status=%u", info.inquiry_status.v1.status);
+                    }
+                    break;
+                case BtdrvEventType_BluetoothCrash:
+                    SW2_LOG_WARN("Core BluetoothCrash: reason=%u", info.bluetooth_crash.reason);
+                    break;
+                default:
+                    break;
+            }
+        }
+
     }
 
     bool IsInitialized() {
@@ -194,7 +283,8 @@ namespace ams::bluetooth::core {
             R_ABORT_UNLESS(btdrvGetEventInfo(&g_event_info, sizeof(bluetooth::EventInfo), &g_current_event_type));
         }
 
-        SW2_LOG_INFO("Core Event: type=%u", (u32)g_current_event_type);
+        SW2_LOG_INFO("Core Event: type=%u (%s)", (u32)g_current_event_type, GetCoreEventTypeName(g_current_event_type));
+        LogCoreEventSummary(g_current_event_type, g_event_info);
 
         // Process custom event and return
         if (g_current_event_type == BtdrvEventType_MissionControlCustomEvent) {
