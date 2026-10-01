@@ -16,6 +16,7 @@
 #pragma once
 #include <stratosphere.hpp>
 #include "../bluetooth_mitm/bluetooth/bluetooth_types.hpp"
+#include "switch2_protocol.hpp"
 
 namespace ams::controller {
 
@@ -28,31 +29,41 @@ namespace ams::controller {
         Verbose = 4,
     };
 
-    // Packet direction
-    enum class PacketDirection : u8 {
-        In  = 0,
-        Out = 1,
-    };
+    // Stage markers. Only messages containing one of these markers are written:
+    //   [S0] session/startup/config      [S1] BLE scan and raw BLE events
+    //   [S2] Switch 2 identification      [S3] connection and GATT setup
+    //   [S4] command protocol (TX/RX/ACK) [S5] input notifications and forwarding
+    // Result tags: [OK], [FAIL], [DROP], [SKIP], [STATS]. The first [FAIL] or
+    // [DROP] after the last [OK] of a connection identifies the failing step.
 
-    // Initialize the debug logger. Call once at startup.
-    // Writes to sdmc:/config/MissionControl/switch2_debug.log
+    // Initialize a fresh file-only session at sdmc:/config/MissionControl/switch2_debug.log.
+    // Serialized with logging/finalization; setup failure leaves logging disabled.
+    // No GDB output. Session header and subsequent writes are synchronous/best-effort.
     void Switch2DebugInit(Switch2LogLevel level = Switch2LogLevel::Verbose);
+    // Disable logging under the logger mutex; file handles are already short-lived.
     void Switch2DebugFini();
 
-    // Log a message
+    // Log only messages whose format and formatted text contain an [S0]-[S5] marker.
+    // State, sequence and static scratch buffers are mutex-protected through file I/O.
+    // Long messages are truncated but retain a trailing newline; callers may block on SD I/O.
     void Switch2DebugLog(Switch2LogLevel level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
-    // Log a raw HID report (hex dump)
-    void Switch2DebugLogReport(PacketDirection dir, const bluetooth::Address &addr,
-                               const u8 *data, size_t size);
-
-    // Log a Bluetooth event (connection, disconnection, etc.)
-    void Switch2DebugLogBtEvent(const char *event, const bluetooth::Address &addr);
+    // Same as Switch2DebugLog, then appends " len=<size> data=<hex>" (first 64 bytes,
+    // "..." if truncated). Hex is formatted in the logger's protected scratch buffer.
+    void Switch2DebugLogData(Switch2LogLevel level, const void *data, size_t size, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
 
     // Convenience macros
     #define SW2_LOG_ERROR(fmt, ...)   ::ams::controller::Switch2DebugLog(::ams::controller::Switch2LogLevel::Error,   "[ERROR] " fmt, ##__VA_ARGS__)
     #define SW2_LOG_WARN(fmt, ...)    ::ams::controller::Switch2DebugLog(::ams::controller::Switch2LogLevel::Warning, "[WARN]  " fmt, ##__VA_ARGS__)
     #define SW2_LOG_INFO(fmt, ...)    ::ams::controller::Switch2DebugLog(::ams::controller::Switch2LogLevel::Info,    "[INFO]  " fmt, ##__VA_ARGS__)
     #define SW2_LOG_VERBOSE(fmt, ...) ::ams::controller::Switch2DebugLog(::ams::controller::Switch2LogLevel::Verbose, "[VERB]  " fmt, ##__VA_ARGS__)
+
+    #define SW2_LOG_DATA_WARN(data, size, fmt, ...)    ::ams::controller::Switch2DebugLogData(::ams::controller::Switch2LogLevel::Warning, data, size, "[WARN]  " fmt, ##__VA_ARGS__)
+    #define SW2_LOG_DATA_INFO(data, size, fmt, ...)    ::ams::controller::Switch2DebugLogData(::ams::controller::Switch2LogLevel::Info,    data, size, "[INFO]  " fmt, ##__VA_ARGS__)
+    #define SW2_LOG_DATA_VERBOSE(data, size, fmt, ...) ::ams::controller::Switch2DebugLogData(::ams::controller::Switch2LogLevel::Verbose, data, size, "[VERB]  " fmt, ##__VA_ARGS__)
+
+    // Format arguments for a Result: "rc=0x%08X(%s)".
+    #define SW2_RC_FMT "rc=0x%08X(%s)"
+    #define SW2_RC_ARGS(rc) static_cast<u32>((rc).GetValue()), ::ams::controller::switch2::DescribeResult(static_cast<u32>((rc).GetValue()))
 
 }

@@ -39,6 +39,7 @@ namespace ams::controller {
 
     void RegisterDiscoveredSwitch2Controller(const bluetooth::Address &address, ControllerType type) {
         std::scoped_lock lk(g_discovery_lock);
+        if (g_discovered_controllers.size() >= 32 && g_discovered_controllers.find(address) == g_discovered_controllers.end()) return;
         g_discovered_controllers[address] = type;
     }
 

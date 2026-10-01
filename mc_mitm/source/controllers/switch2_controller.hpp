@@ -15,6 +15,7 @@
  */
 #pragma once
 #include "emulated_switch_controller.hpp"
+#include "switch2_protocol.hpp"
 
 namespace ams::controller {
 
@@ -104,6 +105,10 @@ namespace ams::controller {
             void ProcessInputData(const bluetooth::HidReport *report) override;
 
         protected:
+            bluetooth::HidReport m_payload_report = {};
+            bool m_logged_invalid_input = false;
+            u32 m_last_logged_buttons = 0;
+
             // Builds a Switch 2 command frame to be written to the controller's
             // command characteristic (UUID 649d4ac9-8eb7-4e6c-af44-1ea54fe5f005).
             void MakeSwitch2Command(bluetooth::HidReport *report, u8 cmd_id, u8 sub_id, const u8 *data, u8 data_len);
@@ -119,10 +124,10 @@ namespace ams::controller {
             void MapInputReport0x0A(const bluetooth::HidReport *report);
 
             static u16 Unpack12BitStickX(const u8 *data) {
-                return static_cast<u16>(((data[1] & 0x0F) << 8) | data[0]);
+                return switch2::StickX(data);
             }
             static u16 Unpack12BitStickY(const u8 *data) {
-                return static_cast<u16>((data[2] << 4) | ((data[1] & 0xF0) >> 4));
+                return switch2::StickY(data);
             }
     };
 

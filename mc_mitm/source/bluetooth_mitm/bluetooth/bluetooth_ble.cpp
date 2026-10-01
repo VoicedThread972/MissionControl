@@ -18,6 +18,8 @@
 #include "../../controllers/switch2_debug.hpp"
 #include "../../controllers/switch2_discovery.hpp"
 #include "../../controllers/controller_management.hpp"
+#include "../../controllers/switch2_protocol.hpp"
+#include "../../mcmitm_config.hpp"
 #include <cstdio>
 #include <map>
 
@@ -48,28 +50,106 @@ namespace ams::bluetooth::ble {
         };
         std::map<u32, bluetooth::Address> g_conn_map;
         std::map<bluetooth::Address, u32, AddressCompare> g_ble_conn_ids;
+        std::map<u32, u64> g_connection_generations;
+        u64 g_next_connection_generation = 0;
+
+        namespace sw2 = controller::switch2;
+
+        constexpr u32 Sw2Error(sw2::Error error) {
+            return sw2::MakeResultValue(error);
+        }
+
+        // Reasons a notification on a tracked Switch 2 connection did not reach a handler.
+        enum NotifyDrop : u8 {
+            NotifyDrop_ForeignService,
+            NotifyDrop_UnexpectedChar,
+            NotifyDrop_NotReady,
+            NotifyDrop_NoHandler,
+            NotifyDrop_TooShort,
+            NotifyDrop_HandlerError,
+            NotifyDrop_Count,
+        };
+
+        constexpr const char *NotifyDropNames[NotifyDrop_Count] = {
+            "FOREIGN-SERVICE",
+            "UNEXPECTED-CHAR",
+            "NOT-READY",
+            "NO-HANDLER",
+            "TOO-SHORT",
+            "HANDLER-ERROR",
+        };
+
+        // Per-connection counters, guarded by g_conn_map_lock. Logged on disconnect
+        // so a session shows how far traffic progressed even without per-packet logs.
+        struct Switch2ConnectionStats {
+            u32 notifications;
+            u32 responses;
+            u32 responses_rejected;
+            u32 delivered;
+            u32 commands_ok;
+            u32 commands_failed;
+            u32 drops[NotifyDrop_Count];
+            u32 logged_drop_mask;
+            bool first_input_logged;
+        };
+        std::map<u32, Switch2ConnectionStats> g_connection_stats;
+
+        constexpr u32 MaxRejectedResponseLogs = 16;
+        constexpr u32 InputAliveLogInterval = 1000;
+
+        // Event-thread-only counters for rate-limited scan/notify diagnostics.
+        u32 g_scan_results_seen = 0;
+        u32 g_nonmatching_0553_logs = 0;
+        u32 g_untracked_notify_logs = 0;
+        constexpr u32 MaxScanResultLogs = 32;
+        constexpr u32 ScanSummaryInterval = 256;
+        constexpr u32 MaxNonmatching0553Logs = 16;
+        constexpr u32 MaxUntrackedNotifyLogs = 4;
 
         struct PendingSwitch2ConnectRequest {
             bluetooth::Address address;
             controller::ControllerType type;
         };
 
-        struct Switch2CommandResponseState {
-            u64 sequence;
-            u8 last_cmd;
-            u8 last_sub;
-            u8 last_status;
-            u8 last_ack;
+        using Switch2CommandResponseState = controller::switch2::CommandResponseState;
+
+        struct PendingSwitch2InitRequest {
+            bluetooth::Address address;
+            u32 conn_id;
+            controller::ControllerType type;
+            u64 generation;
         };
+
+        struct Switch2GattPath {
+            BtdrvGattId service;
+            BtdrvGattId command;
+            bool primary;
+            controller::ControllerType type;
+            bool ready;
+        };
+
+        std::map<u32, Switch2GattPath> g_switch2_gatt_paths;
+        std::map<u32, PendingSwitch2InitRequest> g_pending_switch2_init_requests;
+        constinit os::SdkMutex g_switch2_write_lock;
+
+        Result InitializeSwitch2Gatt(const PendingSwitch2InitRequest &request);
 
         constinit os::SdkMutex g_switch2_connect_queue_lock;
         os::Event g_switch2_connect_queue_event(os::EventClearMode_AutoClear);
         std::map<bluetooth::Address, PendingSwitch2ConnectRequest, AddressCompare> g_pending_switch2_connect_requests;
         std::map<bluetooth::Address, u64, AddressCompare> g_last_switch2_connect_attempt_ns;
 
+        struct Switch2DiscoveredEntry {
+            u32 index;
+            controller::ControllerType type;
+        };
+
+        constinit os::SdkMutex g_switch2_discovered_list_lock;
+        std::map<bluetooth::Address, Switch2DiscoveredEntry, AddressCompare> g_switch2_discovered_list;
+        u32 g_switch2_discovered_count = 0;
+
         constinit os::SdkMutex g_switch2_cmd_response_lock;
         std::map<u32, Switch2CommandResponseState> g_switch2_cmd_responses;
-        std::map<u32, bool> g_switch2_prefer_universal_input;
 
         constexpr s32 Switch2ConnectWorkerThreadPriority = 18;
         constexpr size_t Switch2ConnectWorkerThreadStackSize = 0x3000;
@@ -80,7 +160,6 @@ namespace ams::bluetooth::ble {
         constexpr u64 Switch2ConnectRetryIntervalNs = 2'000'000'000ull;
 
         constexpr BtdrvGattAttributeUuid Switch2InputServiceUuid = { 16, { 0xab, 0x7d, 0xe9, 0xbe, 0x89, 0xfe, 0x49, 0xad, 0x82, 0x8f, 0x11, 0x8f, 0x09, 0xdf, 0x7f, 0xd0 } };
-        constexpr BtdrvGattAttributeUuid Switch2InputReport0x05CharUuid = { 16, { 0xab, 0x7d, 0xe9, 0xbe, 0x89, 0xfe, 0x49, 0xad, 0x82, 0x8f, 0x11, 0x8f, 0x09, 0xdf, 0x7f, 0xd2 } };
         constexpr BtdrvGattAttributeUuid Switch2JoyConLInputCharUuid = { 16, { 0xcc, 0x1b, 0xbb, 0xb5, 0x73, 0x54, 0x4d, 0x32, 0xa7, 0x16, 0xa8, 0x1c, 0xb2, 0x41, 0xa3, 0x2a } };
         constexpr BtdrvGattAttributeUuid Switch2JoyConRInputCharUuid = { 16, { 0xd5, 0xa9, 0xe0, 0x1e, 0x2f, 0xfc, 0x4c, 0xca, 0xb2, 0x0c, 0x8b, 0x67, 0x14, 0x2b, 0xf4, 0x42 } };
         constexpr BtdrvGattAttributeUuid Switch2ProInputCharUuid = { 16, { 0x74, 0x92, 0x86, 0x6c, 0xec, 0x3e, 0x46, 0x19, 0x82, 0x58, 0x32, 0x75, 0x5f, 0xfc, 0xc0, 0xf8 } };
@@ -88,7 +167,7 @@ namespace ams::bluetooth::ble {
         constexpr BtdrvGattAttributeUuid Switch2CommandCharUuid = { 16, { 0x64, 0x9d, 0x4a, 0xc9, 0x8e, 0xb7, 0x4e, 0x6c, 0xaf, 0x44, 0x1e, 0xa5, 0x4f, 0xe5, 0xf0, 0x05 } };
         constexpr BtdrvGattAttributeUuid Switch2CommandResponse1CharUuid = { 16, { 0xc7, 0x65, 0xa9, 0x61, 0xd9, 0xd8, 0x4d, 0x36, 0xa2, 0x0a, 0x53, 0x15, 0xb1, 0x11, 0x83, 0x6a } };
 
-        const char *GetBleEventTypeName(const bluetooth::BleEventType type) {
+        [[maybe_unused]] const char *GetBleEventTypeName(const bluetooth::BleEventType type) {
             switch (type) {
                 case BtdrvBleEventType_ClientRegistration:            return "ClientRegistration";
                 case BtdrvBleEventType_ServerRegistration:            return "ServerRegistration";
@@ -117,7 +196,7 @@ namespace ams::bluetooth::ble {
             }
         }
 
-        void FormatGattUuid(char *buf, size_t bufsz, const BtdrvGattAttributeUuid &uuid) {
+        [[maybe_unused]] void FormatGattUuid(char *buf, size_t bufsz, const BtdrvGattAttributeUuid &uuid) {
             if (uuid.size == 16) {
                 std::snprintf(
                     buf,
@@ -139,7 +218,8 @@ namespace ams::bluetooth::ble {
         }
 
         bool UuidEquals(const BtdrvGattAttributeUuid &lhs, const BtdrvGattAttributeUuid &rhs) {
-            return lhs.size == rhs.size && std::memcmp(lhs.uuid, rhs.uuid, lhs.size) == 0;
+            return (lhs.size == 2 || lhs.size == 4 || lhs.size == 16) &&
+                   lhs.size == rhs.size && std::memcmp(lhs.uuid, rhs.uuid, lhs.size) == 0;
         }
 
         const BtdrvGattAttributeUuid *GetSwitch2InputCharUuid(controller::ControllerType type) {
@@ -152,13 +232,6 @@ namespace ams::bluetooth::ble {
             }
         }
 
-        controller::ControllerType DecodeSwitch2TypeFromInputUuid(const BtdrvGattAttributeUuid &uuid) {
-            if (UuidEquals(uuid, Switch2JoyConLInputCharUuid)) return controller::ControllerType_Switch2JoyConL;
-            if (UuidEquals(uuid, Switch2JoyConRInputCharUuid)) return controller::ControllerType_Switch2JoyConR;
-            if (UuidEquals(uuid, Switch2ProInputCharUuid)) return controller::ControllerType_Switch2ProController;
-            if (UuidEquals(uuid, Switch2NsoGcInputCharUuid)) return controller::ControllerType_Switch2NSOGCController;
-            return controller::ControllerType_Unknown;
-        }
 
         bool IsSwitch2ControllerType(controller::ControllerType type) {
             switch (type) {
@@ -172,6 +245,16 @@ namespace ams::bluetooth::ble {
             }
         }
 
+        const char *GetSwitch2ControllerTypeName(controller::ControllerType type) {
+            switch (type) {
+                case controller::ControllerType_Switch2JoyConL:         return "Joy-Con 2 L";
+                case controller::ControllerType_Switch2JoyConR:         return "Joy-Con 2 R";
+                case controller::ControllerType_Switch2ProController:   return "Pro Controller 2";
+                case controller::ControllerType_Switch2NSOGCController: return "NSO GC Controller 2";
+                default:                                                return "Unknown";
+            }
+        }
+
         controller::ControllerType ResolveSwitch2TypeFromPairedInfo(const bluetooth::Address &address) {
             bluetooth::DevicesSettings device_settings = {};
             if (R_FAILED(btdrvGetPairedDeviceInfo(address, &device_settings))) {
@@ -180,6 +263,32 @@ namespace ams::bluetooth::ble {
 
             const controller::ControllerType type = controller::Identify(&device_settings);
             return IsSwitch2ControllerType(type) ? type : controller::ControllerType_Unknown;
+        }
+
+        void RegisterSwitch2DiscoveryListEntry(const bluetooth::Address &address, controller::ControllerType type, u32 *out_index, bool *out_is_new) {
+            bool is_new = false;
+            u32 index = 0;
+
+            {
+                std::scoped_lock lk(g_switch2_discovered_list_lock);
+                auto it = g_switch2_discovered_list.find(address);
+                if (it == g_switch2_discovered_list.end()) {
+                    if (g_switch2_discovered_list.size() >= 32) return;
+                    index = ++g_switch2_discovered_count;
+                    g_switch2_discovered_list.emplace(address, Switch2DiscoveredEntry{index, type});
+                    is_new = true;
+                } else {
+                    it->second.type = type;
+                    index = it->second.index;
+                }
+            }
+
+            if (out_index) {
+                *out_index = index;
+            }
+            if (out_is_new) {
+                *out_is_new = is_new;
+            }
         }
 
         bool HasBleConnection(const bluetooth::Address &address, u32 *out_conn_id) {
@@ -195,14 +304,73 @@ namespace ams::bluetooth::ble {
             return true;
         }
 
-        void SetBleConnection(const bluetooth::Address &address, u32 conn_id) {
+        bool IsCurrentConnection(const PendingSwitch2InitRequest &request) {
             std::scoped_lock lk(g_conn_map_lock);
-            g_ble_conn_ids[address] = conn_id;
+            const auto address = g_ble_conn_ids.find(request.address);
+            const auto generation = g_connection_generations.find(request.conn_id);
+            return address != g_ble_conn_ids.end() && address->second == request.conn_id &&
+                   generation != g_connection_generations.end() && generation->second == request.generation;
         }
 
-        void ClearBleConnection(const bluetooth::Address &address) {
+        // Returns true only for the first drop of this reason on this connection.
+        bool CountNotifyDrop(u32 conn_id, NotifyDrop reason) {
             std::scoped_lock lk(g_conn_map_lock);
-            g_ble_conn_ids.erase(address);
+            const auto it = g_connection_stats.find(conn_id);
+            if (it == g_connection_stats.end()) return false;
+            ++it->second.drops[reason];
+            const u32 bit = 1u << reason;
+            if ((it->second.logged_drop_mask & bit) != 0) return false;
+            it->second.logged_drop_mask |= bit;
+            return true;
+        }
+
+        void CountCommand(u32 conn_id, bool ok) {
+            std::scoped_lock lk(g_conn_map_lock);
+            const auto it = g_connection_stats.find(conn_id);
+            if (it == g_connection_stats.end()) return;
+            ++(ok ? it->second.commands_ok : it->second.commands_failed);
+        }
+
+        void LogConnectionStats(u32 conn_id, const Switch2ConnectionStats &s) {
+            SW2_LOG_INFO(
+                "[S5][STATS] conn_id=%u notify=%u responses=%u rejected=%u delivered=%u cmd_ok=%u cmd_fail=%u "
+                "drop{foreign=%u unexpected=%u not_ready=%u no_handler=%u short=%u handler=%u}",
+                conn_id, s.notifications, s.responses, s.responses_rejected, s.delivered, s.commands_ok, s.commands_failed,
+                s.drops[NotifyDrop_ForeignService], s.drops[NotifyDrop_UnexpectedChar], s.drops[NotifyDrop_NotReady],
+                s.drops[NotifyDrop_NoHandler], s.drops[NotifyDrop_TooShort], s.drops[NotifyDrop_HandlerError]
+            );
+        }
+
+        Result LogGattStep(u32 conn_id, const char *target, const char *step, Result rc) {
+            if (R_FAILED(rc)) {
+                SW2_LOG_WARN("[S3][FAIL][GATT-%s-%s] conn_id=%u " SW2_RC_FMT, target, step, conn_id, SW2_RC_ARGS(rc));
+            } else {
+                SW2_LOG_INFO("[S3][OK][GATT-%s-%s] conn_id=%u", target, step, conn_id);
+            }
+            return rc;
+        }
+
+        Result LogStaleConnection(const PendingSwitch2InitRequest &request, const char *step) {
+            SW2_LOG_WARN("[S3][FAIL][GATT-STALE] conn_id=%u generation=%llu step=%s connection replaced or disconnected",
+                request.conn_id, static_cast<unsigned long long>(request.generation), step);
+            return Sw2Error(sw2::Error::StaleConnection);
+        }
+
+        void QueueSwitch2Initialize(const PendingSwitch2InitRequest &request) {
+            std::scoped_lock lk(g_switch2_connect_queue_lock);
+            // btm supports at most four concurrent BLE connections.
+            if (g_pending_switch2_init_requests.size() >= 4) return;
+            g_pending_switch2_init_requests.emplace(request.conn_id, request);
+            g_switch2_connect_queue_event.Signal();
+        }
+
+        bool PopSwitch2Initialize(PendingSwitch2InitRequest *request) {
+            std::scoped_lock lk(g_switch2_connect_queue_lock);
+            if (g_pending_switch2_init_requests.empty()) return false;
+            auto it = g_pending_switch2_init_requests.begin();
+            *request = it->second;
+            g_pending_switch2_init_requests.erase(it);
+            return true;
         }
 
         u64 GetCurrentTimeNs() {
@@ -239,23 +407,40 @@ namespace ams::bluetooth::ble {
             }
 
             bool inserted = false;
+            bool queue_full = false;
             {
                 std::scoped_lock lk(g_switch2_connect_queue_lock);
 
                 const u64 now_ns = GetCurrentTimeNs();
-                auto last_attempt_it = g_last_switch2_connect_attempt_ns.find(address);
-                if (last_attempt_it != g_last_switch2_connect_attempt_ns.end()) {
-                    if (now_ns - last_attempt_it->second < Switch2ConnectRetryIntervalNs) {
-                        return;
+                if (g_pending_switch2_connect_requests.size() >= 4 ||
+                    (g_last_switch2_connect_attempt_ns.size() >= 32 &&
+                     g_last_switch2_connect_attempt_ns.find(address) == g_last_switch2_connect_attempt_ns.end())) {
+                    queue_full = true;
+                } else {
+                    auto last_attempt_it = g_last_switch2_connect_attempt_ns.find(address);
+                    if (last_attempt_it != g_last_switch2_connect_attempt_ns.end()) {
+                        if (now_ns - last_attempt_it->second < Switch2ConnectRetryIntervalNs) {
+                            return;
+                        }
+                    }
+
+                    auto [it, was_inserted] = g_pending_switch2_connect_requests.emplace(address, PendingSwitch2ConnectRequest{address, type});
+                    if (!was_inserted) {
+                        it->second.type = type;
+                    } else {
+                        inserted = true;
                     }
                 }
+            }
 
-                auto [it, was_inserted] = g_pending_switch2_connect_requests.emplace(address, PendingSwitch2ConnectRequest{address, type});
-                if (!was_inserted) {
-                    it->second.type = type;
-                } else {
-                    inserted = true;
-                }
+            if (queue_full) {
+                SW2_LOG_WARN(
+                    "[S3][FAIL][CONNECT-QUEUE] queue/table full type=%s mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                    GetSwitch2ControllerTypeName(type),
+                    address.address[0], address.address[1], address.address[2],
+                    address.address[3], address.address[4], address.address[5]
+                );
+                return;
             }
 
             if (!inserted) {
@@ -263,9 +448,9 @@ namespace ams::bluetooth::ble {
             }
 
             SW2_LOG_INFO(
-                "Queued Switch 2 BLE connect request: reason=%s type=%u addr=%02X:%02X:%02X:%02X:%02X:%02X",
+                "[S3][OK][CONNECT-QUEUE] reason=%s type=%s mac=%02X:%02X:%02X:%02X:%02X:%02X",
                 reason,
-                static_cast<u32>(type),
+                GetSwitch2ControllerTypeName(type),
                 address.address[0], address.address[1], address.address[2],
                 address.address[3], address.address[4], address.address[5]
             );
@@ -284,18 +469,47 @@ namespace ams::bluetooth::ble {
                     }
 
                     SW2_LOG_INFO(
-                        "Switch 2 connect worker: btmBleConnect type=%u addr=%02X:%02X:%02X:%02X:%02X:%02X",
-                        static_cast<u32>(request.type),
+                        "[S3][CONNECT-ATTEMPT] type=%s mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                        GetSwitch2ControllerTypeName(request.type),
                         request.address.address[0], request.address.address[1], request.address.address[2],
                         request.address.address[3], request.address.address[4], request.address.address[5]
                     );
 
                     const Result rc_connect = ConnectSwitch2Controller(request.address);
                     if (R_FAILED(rc_connect)) {
-                        SW2_LOG_WARN("Switch 2 connect worker: btmBleConnect failed rc=0x%08X", static_cast<u32>(rc_connect.GetValue()));
+                        SW2_LOG_WARN("[S3][FAIL][CONNECT-REQUEST] " SW2_RC_FMT, SW2_RC_ARGS(rc_connect));
+                    } else {
+                        SW2_LOG_INFO("[S3][OK][CONNECT-REQUEST] submitted; expect [S3][OK][CONNECTED] next");
                     }
 
                     os::SleepThread(ams::TimeSpan::FromMilliSeconds(100));
+                }
+
+                PendingSwitch2InitRequest init_request = {};
+                while (PopSwitch2Initialize(&init_request)) {
+                    const u64 start_ns = GetCurrentTimeNs();
+                    const Result rc = InitializeSwitch2Gatt(init_request);
+                    const u32 elapsed_ms = static_cast<u32>((GetCurrentTimeNs() - start_ns) / 1'000'000ull);
+                    if (R_SUCCEEDED(rc)) {
+                        SW2_LOG_INFO("[S3][OK][GATT-SETUP] conn_id=%u elapsed_ms=%u input routing enabled", init_request.conn_id, elapsed_ms);
+                    } else {
+                        SW2_LOG_WARN("[S3][FAIL][GATT-SETUP] conn_id=%u elapsed_ms=%u " SW2_RC_FMT " (see preceding [FAIL] for the exact step)",
+                            init_request.conn_id, elapsed_ms, SW2_RC_ARGS(rc));
+                        if (IsCurrentConnection(init_request)) {
+                            controller::RemoveHandler(init_request.address);
+                            {
+                                std::scoped_lock lk(g_conn_map_lock);
+                                g_switch2_gatt_paths.erase(init_request.conn_id);
+                            }
+                            Result rc_disconnect = btmInitialize();
+                            if (R_SUCCEEDED(rc_disconnect)) {
+                                rc_disconnect = btmBleDisconnect(init_request.conn_id);
+                                btmExit();
+                            }
+                            SW2_LOG_INFO("[S3][CLEANUP] conn_id=%u handler removed, disconnect " SW2_RC_FMT,
+                                init_request.conn_id, SW2_RC_ARGS(rc_disconnect));
+                        }
+                    }
                 }
             }
         }
@@ -321,52 +535,51 @@ namespace ams::bluetooth::ble {
 
         void ResetSwitch2CommandState(u32 conn_id) {
             std::scoped_lock lk(g_switch2_cmd_response_lock);
-            g_switch2_cmd_responses[conn_id] = Switch2CommandResponseState{0, 0, 0, 0, 0};
-            g_switch2_prefer_universal_input[conn_id] = false;
+            g_switch2_cmd_responses[conn_id] = {};
         }
 
         void ClearSwitch2CommandState(u32 conn_id) {
             std::scoped_lock lk(g_switch2_cmd_response_lock);
             g_switch2_cmd_responses.erase(conn_id);
-            g_switch2_prefer_universal_input.erase(conn_id);
-        }
-
-        void SetSwitch2PreferUniversalInput(u32 conn_id, bool enabled) {
-            std::scoped_lock lk(g_switch2_cmd_response_lock);
-            g_switch2_prefer_universal_input[conn_id] = enabled;
-        }
-
-        bool GetSwitch2PreferUniversalInput(u32 conn_id) {
-            std::scoped_lock lk(g_switch2_cmd_response_lock);
-            auto it = g_switch2_prefer_universal_input.find(conn_id);
-            return (it != g_switch2_prefer_universal_input.end()) ? it->second : false;
         }
 
         void RecordSwitch2CommandResponse(u32 conn_id, const u8 *data, u16 size) {
-            if (size < 4) {
+            sw2::AcceptResult result = sw2::AcceptResult::NotAwaiting;
+            u8 expected_cmd = 0;
+            u8 expected_sub = 0;
+            {
+                std::scoped_lock lk(g_switch2_cmd_response_lock);
+                const auto it = g_switch2_cmd_responses.find(conn_id);
+                if (it != g_switch2_cmd_responses.end()) {
+                    expected_cmd = it->second.command;
+                    expected_sub = it->second.subcommand;
+                    result = it->second.Accept(data, size);
+                } else if (!sw2::IsCommandResponse(data, size)) {
+                    result = sw2::AcceptResult::Malformed;
+                }
+            }
+
+            if (result == sw2::AcceptResult::Accepted) {
+                SW2_LOG_DATA_INFO(data, size, "[S4][CMD-RX] conn_id=%u cmd=0x%02X sub=0x%02X ack=0x%02X result=%s",
+                    conn_id, data[0], data[3], data[5], sw2::AcceptResultName(result));
                 return;
             }
 
-            std::scoped_lock lk(g_switch2_cmd_response_lock);
-            auto &state = g_switch2_cmd_responses[conn_id];
-            state.sequence += 1;
-            state.last_cmd = data[0];
-            state.last_status = (size > 1) ? data[1] : 0;
-            state.last_sub = data[3];
-            state.last_ack = (size > 5) ? data[5] : 0;
+            bool should_log = false;
+            {
+                std::scoped_lock lk(g_conn_map_lock);
+                const auto it = g_connection_stats.find(conn_id);
+                if (it != g_connection_stats.end()) {
+                    should_log = ++it->second.responses_rejected <= MaxRejectedResponseLogs;
+                }
+            }
+            if (should_log) {
+                SW2_LOG_DATA_WARN(data, size, "[S4][DROP][CMD-RX] conn_id=%u result=%s awaiting_cmd=0x%02X awaiting_sub=0x%02X",
+                    conn_id, sw2::AcceptResultName(result), expected_cmd, expected_sub);
+            }
         }
 
-        bool WaitForSwitch2CommandResponse(u32 conn_id, u8 cmd_id, u8 sub_id, u32 timeout_ms) {
-            u64 seen_sequence = 0;
-            {
-                std::scoped_lock lk(g_switch2_cmd_response_lock);
-                auto it = g_switch2_cmd_responses.find(conn_id);
-                if (it == g_switch2_cmd_responses.end()) {
-                    return false;
-                }
-                seen_sequence = it->second.sequence;
-            }
-
+        Result WaitForSwitch2CommandResponse(u32 conn_id, u32 timeout_ms, u8 *out_ack) {
             const u64 timeout_ns = static_cast<u64>(timeout_ms) * 1'000'000ull;
             const u64 end_ns = GetCurrentTimeNs() + timeout_ns;
 
@@ -374,22 +587,22 @@ namespace ams::bluetooth::ble {
                 {
                     std::scoped_lock lk(g_switch2_cmd_response_lock);
                     auto it = g_switch2_cmd_responses.find(conn_id);
-                    if (it == g_switch2_cmd_responses.end()) {
-                        return false;
+                    if (it == g_switch2_cmd_responses.end() || !it->second.awaiting) {
+                        // Disconnect erased or reconnect reset the transaction.
+                        return Sw2Error(sw2::Error::StaleConnection);
                     }
 
-                    if (it->second.sequence != seen_sequence) {
-                        seen_sequence = it->second.sequence;
-                        if (it->second.last_cmd == cmd_id && it->second.last_sub == sub_id) {
-                            return true;
-                        }
+                    if (it->second.completed) {
+                        *out_ack = it->second.ack;
+                        if (!sw2::IsSuccessfulAck(it->second.ack)) return Sw2Error(sw2::Error::AckRejected);
+                        R_SUCCEED();
                     }
                 }
 
                 os::SleepThread(ams::TimeSpan::FromMilliSeconds(5));
             }
 
-            return false;
+            return Sw2Error(sw2::Error::AckTimeout);
         }
 
         bool IsSwitch2CommandRequest(const bluetooth::HidReport *report) {
@@ -406,6 +619,7 @@ namespace ams::bluetooth::ble {
                 case 0x03:
                 case 0x07:
                 case 0x09:
+                case 0x0A:
                 case 0x0C:
                 case 0x10:
                 case 0x11:
@@ -417,29 +631,116 @@ namespace ams::bluetooth::ble {
             }
         }
 
-        Result RegisterSwitch2GattNotification(u32 conn_id, const BtdrvGattAttributeUuid &char_uuid) {
-            const BtdrvGattId service_id = MakeGattId(Switch2InputServiceUuid);
-            const BtdrvGattId char_id = MakeGattId(char_uuid);
-            R_RETURN(btdrvRegisterGattNotification(conn_id, true, &service_id, &char_id));
+        constexpr u8 GattPropertyWriteNoResponse = BtdrvGattCharacteristicProperty_WriteNoResponse;
+        constexpr u8 GattPropertyWrite           = BtdrvGattCharacteristicProperty_Write;
+        constexpr u8 GattPropertyNotify          = BtdrvGattCharacteristicProperty_Notify;
+        constexpr u8 GattPropertyIndicate        = BtdrvGattCharacteristicProperty_Indicate;
+
+        Result RegisterSwitch2GattNotification(u32 conn_id, const Switch2GattPath &path, const BtdrvGattAttributeUuid &char_uuid, const char *target) {
+            BtdrvGattId char_id = {};
+            BtdrvGattId descriptor_id = {};
+            u8 properties = 0;
+            R_TRY(LogGattStep(conn_id, target, "CHAR", btdrvGetGattFirstCharacteristic(conn_id, &path.service, path.primary, &char_uuid, &properties, &char_id)));
+            if ((properties & (GattPropertyNotify | GattPropertyIndicate)) == 0) {
+                SW2_LOG_WARN("[S3][WARN][GATT-%s-CHAR] conn_id=%u properties=0x%02X lack notify/indicate", target, conn_id, properties);
+            } else {
+                SW2_LOG_VERBOSE("[S3][GATT-%s-CHAR] conn_id=%u properties=0x%02X instance=%u", target, conn_id, properties, char_id.instance_id);
+            }
+            constexpr BtdrvGattAttributeUuid ccc_uuid = {2, {0x29, 0x02}};
+            R_TRY(LogGattStep(conn_id, target, "CCC-DESC", btdrvGetGattFirstDescriptor(conn_id, &path.service, path.primary, &char_id, &ccc_uuid, &descriptor_id)));
+            R_TRY(LogGattStep(conn_id, target, "DATA-PATH", btdrvRegisterGattManagedDataPath(&char_uuid)));
+            R_TRY(LogGattStep(conn_id, target, "NOTIFY-REG", btdrvRegisterGattNotification(conn_id, path.primary, &path.service, &char_id)));
+            constexpr u8 enable_notifications[] = {0x01, 0x00};
+            // IPC success only means the request was queued; the first notification proves delivery.
+            R_RETURN(LogGattStep(conn_id, target, "CCC-WRITE", btdrvWriteGattDescriptor(conn_id, path.primary, &path.service, &char_id, &descriptor_id, enable_notifications, sizeof(enable_notifications), 0)));
         }
 
-        Result RegisterSwitch2GattNotifications(u32 conn_id, controller::ControllerType type) {
-            const auto input_uuid = GetSwitch2InputCharUuid(type);
+        Result InitializeSwitch2Gatt(const PendingSwitch2InitRequest &request) {
+            const auto input_uuid = GetSwitch2InputCharUuid(request.type);
             if (!input_uuid) {
-                return MAKERESULT(0x123, 2);
+                SW2_LOG_WARN("[S3][FAIL][GATT-TYPE] conn_id=%u unsupported type=%u", request.conn_id, static_cast<u32>(request.type));
+                return Sw2Error(sw2::Error::UnsupportedType);
             }
 
-            R_TRY(RegisterSwitch2GattNotification(conn_id, Switch2CommandResponse1CharUuid));
-            R_TRY(RegisterSwitch2GattNotification(conn_id, Switch2InputReport0x05CharUuid));
-            R_TRY(RegisterSwitch2GattNotification(conn_id, *input_uuid));
+            SW2_LOG_INFO("[S3][GATT-BEGIN] conn_id=%u type=%s generation=%llu",
+                request.conn_id, GetSwitch2ControllerTypeName(request.type), static_cast<unsigned long long>(request.generation));
+
+            R_TRY(LogGattStep(request.conn_id, "BTM", "INIT", btmInitialize()));
+            ON_SCOPE_EXIT { btmExit(); };
+            BtmGattService service = {};
+            bool found = false;
+            // btm owns service discovery. Wait for its cache, without taking over
+            // the shared driver's discovery or scan lifecycle.
+            constexpr unsigned int ServiceLookupAttempts = 100;
+            constexpr unsigned int ServiceLookupIntervalMs = 20;
+            unsigned int attempt = 0;
+            for (; attempt < ServiceLookupAttempts; ++attempt) {
+                if (!IsCurrentConnection(request)) return LogStaleConnection(request, "SERVICE-LOOKUP");
+                const Result rc = btmGetGattService(request.conn_id, &Switch2InputServiceUuid, &service, &found);
+                if (R_FAILED(rc)) return LogGattStep(request.conn_id, "SERVICE", "LOOKUP", rc);
+                if (found) break;
+                os::SleepThread(ams::TimeSpan::FromMilliSeconds(ServiceLookupIntervalMs));
+            }
+            if (!found) {
+                SW2_LOG_WARN("[S3][FAIL][GATT-SERVICE-LOOKUP] conn_id=%u service ab7de9be... absent from btm cache after %u attempts (%u ms)",
+                    request.conn_id, ServiceLookupAttempts, ServiceLookupAttempts * ServiceLookupIntervalMs);
+                return Sw2Error(sw2::Error::ServiceNotFound);
+            }
+            SW2_LOG_INFO("[S3][OK][GATT-SERVICE-LOOKUP] conn_id=%u attempts=%u handle=0x%04X end=0x%04X instance=%u primary=%u",
+                request.conn_id, attempt + 1, service.handle, service.end_group_handle, service.instance_id, service.primary_service);
+            if (service.instance_id > 0xFF || !UuidEquals(service.uuid, Switch2InputServiceUuid)) {
+                SW2_LOG_WARN("[S3][FAIL][GATT-SERVICE-VALIDATE] conn_id=%u instance=%u uuid_size=%u (btdrv needs u8 instance and matching UUID)",
+                    request.conn_id, service.instance_id, service.uuid.size);
+                return Sw2Error(sw2::Error::ServiceNotFound);
+            }
+            Switch2GattPath path = {};
+            path.service = MakeGattId(Switch2InputServiceUuid);
+            path.service.instance_id = static_cast<u8>(service.instance_id);
+            path.primary = service.primary_service != 0;
+            path.type = request.type;
+            u8 properties = 0;
+            R_TRY(LogGattStep(request.conn_id, "CMD", "CHAR", btdrvGetGattFirstCharacteristic(request.conn_id, &path.service, path.primary, &Switch2CommandCharUuid, &properties, &path.command)));
+            if ((properties & (GattPropertyWrite | GattPropertyWriteNoResponse)) == 0) {
+                SW2_LOG_WARN("[S3][WARN][GATT-CMD-CHAR] conn_id=%u properties=0x%02X lack write", request.conn_id, properties);
+            } else {
+                SW2_LOG_VERBOSE("[S3][GATT-CMD-CHAR] conn_id=%u properties=0x%02X instance=%u", request.conn_id, properties, path.command.instance_id);
+            }
+            R_TRY(RegisterSwitch2GattNotification(request.conn_id, path, Switch2CommandResponse1CharUuid, "RESP"));
+            // Use the model's default format only. Do not subscribe to competing
+            // streams and infer format from whichever packet arrived first.
+            R_TRY(RegisterSwitch2GattNotification(request.conn_id, path, *input_uuid, "INPUT"));
+            if (!IsCurrentConnection(request)) return LogStaleConnection(request, "PATH-PUBLISH");
+            {
+                std::scoped_lock lk(g_conn_map_lock);
+                const auto it = g_ble_conn_ids.find(request.address);
+                if (it == g_ble_conn_ids.end() || it->second != request.conn_id) return LogStaleConnection(request, "PATH-PUBLISH");
+                g_switch2_gatt_paths[request.conn_id] = path;
+            }
+            // The handler's Initialize() runs the [S4] command bootstrap synchronously.
+            R_TRY(LogGattStep(request.conn_id, "HANDLER", "ATTACH", controller::AttachHandler(request.address)));
+            if (!IsCurrentConnection(request)) {
+                controller::RemoveHandler(request.address);
+                return LogStaleConnection(request, "HANDLER-ATTACH");
+            }
+            {
+                std::scoped_lock lk(g_conn_map_lock);
+                const auto it = g_switch2_gatt_paths.find(request.conn_id);
+                if (it == g_switch2_gatt_paths.end()) return LogStaleConnection(request, "READY");
+                it->second.ready = true;
+            }
 
             R_SUCCEED();
         }
 
         Result WriteSwitch2GattDataReportImpl(u32 conn_id, const bluetooth::HidReport *report) {
-            const BtdrvGattId service_id = MakeGattId(Switch2InputServiceUuid);
-            const BtdrvGattId command_id = MakeGattId(Switch2CommandCharUuid);
-            return btdrvWriteGattCharacteristic(conn_id, true, &service_id, &command_id, report->data, report->size, 0, false);
+            Switch2GattPath path = {};
+            {
+                std::scoped_lock lk(g_conn_map_lock);
+                const auto it = g_switch2_gatt_paths.find(conn_id);
+                if (it == g_switch2_gatt_paths.end()) return Sw2Error(sw2::Error::GattPathMissing);
+                path = it->second;
+            }
+            return btdrvWriteGattCharacteristic(conn_id, path.primary, &path.service, &path.command, report->data, report->size, 0, false);
         }
 
         // Switch 2 advertisement matching follows documentation/bluetooth_interface.md:
@@ -514,85 +815,6 @@ namespace ams::bluetooth::ble {
             (void)info;
         }
 
-        void LogBleEventSummary(const bluetooth::BleEventType type, const bluetooth::BleEventInfo &info) {
-            switch (type) {
-                case BtdrvBleEventType_ClientRegistration:
-                    SW2_LOG_INFO(
-                        "BLE ClientRegistration: result=%u client_if=%u status=%u",
-                        info.client_registration.result,
-                        info.client_registration.client_if,
-                        info.client_registration.status
-                    );
-                    break;
-                case BtdrvBleEventType_ScanFilter:
-                    SW2_LOG_INFO(
-                        "BLE ScanFilter: result=%u action=%u",
-                        info.scan_filter.result,
-                        info.scan_filter.action
-                    );
-                    break;
-                case BtdrvBleEventType_ScanResult:
-                    SW2_LOG_INFO(
-                        "BLE ScanResult: result=%u status=%u(%s) count=%u addr=%02X:%02X:%02X:%02X:%02X:%02X rssi=%d",
-                        info.scan_result.result,
-                        info.scan_result.status,
-                        GetScanStatusName(info.scan_result.status),
-                        info.scan_result.count,
-                        info.scan_result.address.address[0], info.scan_result.address.address[1], info.scan_result.address.address[2],
-                        info.scan_result.address.address[3], info.scan_result.address.address[4], info.scan_result.address.address[5],
-                        info.scan_result.rssi
-                    );
-                    break;
-                case BtdrvBleEventType_ClientConnection:
-                    SW2_LOG_INFO(
-                        "BLE ClientConnection: result=%u status=%u conn_id=%u addr=%02X:%02X:%02X:%02X:%02X:%02X reason=%u",
-                        info.client_connection.result,
-                        info.client_connection.status,
-                        info.client_connection.conn_id,
-                        info.client_connection.address.address[0], info.client_connection.address.address[1], info.client_connection.address.address[2],
-                        info.client_connection.address.address[3], info.client_connection.address.address[4], info.client_connection.address.address[5],
-                        info.client_connection.reason
-                    );
-                    break;
-                case BtdrvBleEventType_ClientNotify:
-                {
-                    char serv_uuid[64] = {};
-                    char char_uuid[64] = {};
-                    FormatGattUuid(serv_uuid, sizeof(serv_uuid), info.client_notify.serv_uuid);
-                    FormatGattUuid(char_uuid, sizeof(char_uuid), info.client_notify.char_uuid);
-
-                    SW2_LOG_INFO(
-                        "BLE ClientNotify: result=%u conn_id=%u size=%u type=%u serv=%s char=%s",
-                        info.client_notify.result,
-                        info.client_notify.conn_id,
-                        info.client_notify.size,
-                        info.client_notify.type,
-                        serv_uuid,
-                        char_uuid
-                    );
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
-
-        void ScanForSwitch2(const bluetooth::BleEventInfo &info) {
-            const u8 *data = reinterpret_cast<const u8 *>(&info);
-            const size_t size = sizeof(bluetooth::BleEventInfo);
-
-            if (size < sizeof(Switch2ManufacturerPrefix)) {
-                return;
-            }
-
-            for (size_t i = 0; i <= size - sizeof(Switch2ManufacturerPrefix); ++i) {
-                if (std::memcmp(&data[i], Switch2ManufacturerPrefix, sizeof(Switch2ManufacturerPrefix)) == 0) {
-                    SW2_LOG_INFO("Switch 2 manufacturer pattern observed in BLE event at offset %zu", i);
-                    break;
-                }
-            }
-        }
-
         void HandleScanResultEvent(const bluetooth::BleEventInfo &info) {
             const auto &sr = info.scan_result;
 
@@ -602,17 +824,24 @@ namespace ams::bluetooth::ble {
             // own scan ever surfaces a Switch 2 advertisement to this MITM.
             //
             // status: 0xFF=scan started, 2=new device found, 1=scan complete.
-            if (sr.status != 2 || sr.count == 0) {
+            if (sr.result != 0 || sr.status != 2) {
+                SW2_LOG_VERBOSE("[S1][SCAN-STATUS] status=%s(0x%02X) result=0x%08X", GetScanStatusName(sr.status), sr.status, sr.result);
                 return;
             }
 
-            SW2_LOG_INFO(
-                "ScanResult device: addr=%02X:%02X:%02X:%02X:%02X:%02X type=%u addr_type=%u rssi=%d ads=%u",
-                sr.address.address[0], sr.address.address[1], sr.address.address[2],
-                sr.address.address[3], sr.address.address[4], sr.address.address[5],
-                static_cast<u32>(sr.device_type), static_cast<u32>(sr.ble_addr_type),
-                sr.rssi, static_cast<u32>(sr.count)
-            );
+            // Rate-limited: the first results prove the MITM sees the console's scan,
+            // then periodic summaries show it keeps running without flooding the SD log.
+            ++g_scan_results_seen;
+            if (g_scan_results_seen <= MaxScanResultLogs) {
+                SW2_LOG_VERBOSE(
+                    "[S1][SCAN-MAC] mac=%02X:%02X:%02X:%02X:%02X:%02X rssi=%d ads=%u addr_type=%u",
+                    sr.address.address[0], sr.address.address[1], sr.address.address[2],
+                    sr.address.address[3], sr.address.address[4], sr.address.address[5],
+                    sr.rssi, static_cast<u32>(sr.count), sr.ble_addr_type
+                );
+            } else if ((g_scan_results_seen % ScanSummaryInterval) == 0) {
+                SW2_LOG_INFO("[S1][SCAN-SUMMARY] results_seen=%u", g_scan_results_seen);
+            }
 
             controller::ControllerType detected = controller::ControllerType_Unknown;
 
@@ -622,35 +851,51 @@ namespace ams::bluetooth::ble {
                     continue;
                 }
 
-                // Dump each advertisement structure so we can verify the on-air format
-                // against documentation/bluetooth_interface.md regardless of a match.
-                char hex[3 * sizeof(ad.data) + 1];
-                size_t pos = 0;
-                for (size_t b = 0; b < ad.size && pos + 3 < sizeof(hex); ++b) {
-                    pos += std::snprintf(hex + pos, sizeof(hex) - pos, "%02X ", ad.data[b]);
-                }
-                SW2_LOG_VERBOSE("  AD type=0x%02X size=%u data=%s", ad.type, static_cast<u32>(ad.size), hex);
-
                 if (MatchSwitch2ManufacturerData(ad)) {
-                    SW2_LOG_INFO("Switch 2 manufacturer AD detected in scan result (%u bytes)", static_cast<u32>(ad.size));
-
                     controller::ControllerType t = DecodeSwitch2TypeFromManufacturerData(ad.data, ad.size);
                     if (t != controller::ControllerType_Unknown) {
                         detected = t;
                         break;
                     }
                 }
+
+                // Nintendo company id but unexpected layout/PID: log so a format change is visible.
+                if (ad.type == 0xFF && ad.size >= 2 &&
+                    static_cast<u16>(ad.data[0] | (static_cast<u16>(ad.data[1]) << 8)) == Switch2ManufacturerCompanyId &&
+                    g_nonmatching_0553_logs < MaxNonmatching0553Logs) {
+                    ++g_nonmatching_0553_logs;
+                    SW2_LOG_DATA_WARN(ad.data, ad.size,
+                        "[S2][SKIP][ADV-0553] mac=%02X:%02X:%02X:%02X:%02X:%02X manufacturer data not a known Switch 2 layout/PID",
+                        sr.address.address[0], sr.address.address[1], sr.address.address[2],
+                        sr.address.address[3], sr.address.address[4], sr.address.address[5]);
+                }
             }
 
             if (detected != controller::ControllerType_Unknown) {
+                u32 list_index = 0;
+                bool is_new = false;
+                RegisterSwitch2DiscoveryListEntry(sr.address, detected, &list_index, &is_new);
+                if (list_index == 0) {
+                    static bool s_logged_list_full = false; // event thread only
+                    if (!s_logged_list_full) {
+                        s_logged_list_full = true;
+                        SW2_LOG_WARN("[S2][FAIL][FOUND] discovery list full (32); ignoring new controllers");
+                    }
+                    return;
+                }
                 controller::RegisterDiscoveredSwitch2Controller(sr.address, detected);
-                SW2_LOG_INFO(
-                    "Registered Switch 2 candidate from scan: type=%u addr=%02X:%02X:%02X:%02X:%02X:%02X rssi=%d",
-                    static_cast<u32>(detected),
-                    sr.address.address[0], sr.address.address[1], sr.address.address[2],
-                    sr.address.address[3], sr.address.address[4], sr.address.address[5],
-                    sr.rssi
-                );
+
+                if (is_new) {
+                    SW2_LOG_INFO(
+                        "[S2][OK][FOUND-%02u] type=%s mac=%02X:%02X:%02X:%02X:%02X:%02X rssi=%d addr_type=%u",
+                        list_index,
+                        GetSwitch2ControllerTypeName(detected),
+                        sr.address.address[0], sr.address.address[1], sr.address.address[2],
+                        sr.address.address[3], sr.address.address[4], sr.address.address[5],
+                        sr.rssi, sr.ble_addr_type
+                    );
+                }
+
                 QueueSwitch2ConnectRequest(sr.address, detected, "ScanResult");
             }
         }
@@ -658,61 +903,88 @@ namespace ams::bluetooth::ble {
         void HandleClientConnectionEvent(const bluetooth::BleEventInfo &info) {
             const auto &cc = info.client_connection;
 
+            if (cc.result != 0 && cc.status != 2) {
+                SW2_LOG_WARN("[S3][FAIL][CONNECTION-EVENT] result=0x%08X status=%u conn_id=%u mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                    cc.result, cc.status, cc.conn_id,
+                    cc.address.address[0], cc.address.address[1], cc.address.address[2],
+                    cc.address.address[3], cc.address.address[4], cc.address.address[5]);
+                return;
+            }
             if (cc.status == 0) {
+                controller::ControllerType sw2_type = controller::GetDiscoveredSwitch2ControllerType(cc.address);
+                if (sw2_type == controller::ControllerType_Unknown) sw2_type = ResolveSwitch2TypeFromPairedInfo(cc.address);
+                // Do not route or remove handlers for unrelated BLE accessories.
+                if (!IsSwitch2ControllerType(sw2_type)) {
+                    SW2_LOG_INFO("[S3][SKIP][CONNECTED] conn_id=%u mac=%02X:%02X:%02X:%02X:%02X:%02X not identified as Switch 2 (no discovery entry or paired info)",
+                        cc.conn_id,
+                        cc.address.address[0], cc.address.address[1], cc.address.address[2],
+                        cc.address.address[3], cc.address.address[4], cc.address.address[5]);
+                    return;
+                }
+                controller::RegisterDiscoveredSwitch2Controller(cc.address, sw2_type);
+                u64 generation = 0;
+                bool rejected = false;
                 {
                     std::scoped_lock lk(g_conn_map_lock);
-                    g_conn_map[cc.conn_id] = cc.address;
+                    if (g_conn_map.find(cc.conn_id) != g_conn_map.end() || g_conn_map.size() >= 4) {
+                        rejected = true;
+                    } else {
+                        g_conn_map[cc.conn_id] = cc.address;
+                        g_ble_conn_ids[cc.address] = cc.conn_id;
+                        generation = ++g_next_connection_generation;
+                        g_connection_generations[cc.conn_id] = generation;
+                        g_connection_stats[cc.conn_id] = {};
+                    }
                 }
-                SetBleConnection(cc.address, cc.conn_id);
+                if (rejected) {
+                    SW2_LOG_WARN("[S3][FAIL][CONNECTED] conn_id=%u duplicate conn_id or 4 connections already tracked", cc.conn_id);
+                    return;
+                }
                 ResetSwitch2CommandState(cc.conn_id);
 
                 SW2_LOG_INFO(
-                    "BLE client connected: conn_id=%u addr=%02X:%02X:%02X:%02X:%02X:%02X",
-                    cc.conn_id,
+                    "[S3][OK][CONNECTED] conn_id=%u type=%s generation=%llu mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                    cc.conn_id, GetSwitch2ControllerTypeName(sw2_type), static_cast<unsigned long long>(generation),
                     cc.address.address[0], cc.address.address[1], cc.address.address[2],
                     cc.address.address[3], cc.address.address[4], cc.address.address[5]
                 );
 
-                controller::ControllerType sw2_type = controller::GetDiscoveredSwitch2ControllerType(cc.address);
-                if (sw2_type == controller::ControllerType_Unknown) {
-                    sw2_type = ResolveSwitch2TypeFromPairedInfo(cc.address);
-                    if (sw2_type != controller::ControllerType_Unknown) {
-                        controller::RegisterDiscoveredSwitch2Controller(cc.address, sw2_type);
-                        SW2_LOG_INFO("Resolved Switch 2 type from paired info: type=%u", static_cast<u32>(sw2_type));
-                    }
-                }
-
-                if (sw2_type != controller::ControllerType_Unknown) {
-                    const Result rc_notify = RegisterSwitch2GattNotifications(cc.conn_id, sw2_type);
-                    if (R_FAILED(rc_notify)) {
-                        SW2_LOG_WARN("Failed to register Switch 2 BLE notifications: 0x%08X", static_cast<u32>(rc_notify.GetValue()));
-                    }
-
-                    if (!controller::LocateHandler(cc.address)) {
-                        controller::AttachHandler(cc.address);
-                    }
-                } else {
-                    SW2_LOG_WARN("BLE client connected without Switch 2 discovery type; skipping Switch 2 notification registration");
-                }
+                QueueSwitch2Initialize({cc.address, cc.conn_id, sw2_type, generation});
             } else if (cc.status == 2) {
+                Switch2ConnectionStats stats = {};
                 {
                     std::scoped_lock lk(g_conn_map_lock);
+                    const auto it = g_ble_conn_ids.find(cc.address);
+                    if (it == g_ble_conn_ids.end() || it->second != cc.conn_id) return;
                     g_conn_map.erase(cc.conn_id);
+                    g_ble_conn_ids.erase(it);
+                    g_switch2_gatt_paths.erase(cc.conn_id);
+                    g_connection_generations.erase(cc.conn_id);
+                    const auto stats_it = g_connection_stats.find(cc.conn_id);
+                    if (stats_it != g_connection_stats.end()) {
+                        stats = stats_it->second;
+                        g_connection_stats.erase(stats_it);
+                    }
                 }
-                ClearBleConnection(cc.address);
                 ClearSwitch2CommandState(cc.conn_id);
 
                 SW2_LOG_INFO(
-                    "BLE client disconnected: conn_id=%u addr=%02X:%02X:%02X:%02X:%02X:%02X reason=%u",
+                    "[S3][DISCONNECTED] conn_id=%u mac=%02X:%02X:%02X:%02X:%02X:%02X reason=0x%04X result=0x%08X",
                     cc.conn_id,
                     cc.address.address[0], cc.address.address[1], cc.address.address[2],
                     cc.address.address[3], cc.address.address[4], cc.address.address[5],
-                    cc.reason
+                    cc.reason, cc.result
                 );
+                LogConnectionStats(cc.conn_id, stats);
 
                 controller::RemoveHandler(cc.address);
+            } else {
+                SW2_LOG_VERBOSE("[S3][CONNECTION-EVENT] conn_id=%u unhandled status=%u", cc.conn_id, cc.status);
             }
         }
+
+        // Event thread only: scratch for UUID text in rate-limited drop logs.
+        char g_uuid_text[40];
 
         void HandleClientNotifyEvent(const bluetooth::BleEventInfo &info) {
             const auto &cn = info.client_notify;
@@ -725,104 +997,176 @@ namespace ams::bluetooth::ble {
                 if (it != g_conn_map.end()) {
                     addr = it->second;
                     have_addr = true;
+                    const auto stats = g_connection_stats.find(cn.conn_id);
+                    if (stats != g_connection_stats.end()) ++stats->second.notifications;
                 }
             }
 
             if (!have_addr) {
-                SW2_LOG_WARN("BLE notify without known conn_id mapping: conn_id=%u size=%u", cn.conn_id, cn.size);
+                // Notifications of other BLE peripherals are expected; log only a few.
+                if (g_untracked_notify_logs < MaxUntrackedNotifyLogs) {
+                    ++g_untracked_notify_logs;
+                    SW2_LOG_VERBOSE("[S5][SKIP][NOTIFY-UNTRACKED] conn_id=%u size=%u (not a tracked Switch 2 connection)", cn.conn_id, cn.size);
+                }
+                return;
+            }
+
+            if (cn.result != 0 || cn.size == 0 || cn.size > sizeof(cn.data) || (cn.type != 4 && cn.type != 5)) {
+                SW2_LOG_WARN("[S5][DROP][NOTIFY-EVENT] conn_id=%u result=0x%08X type=%u size=%u", cn.conn_id, cn.result, cn.type, cn.size);
                 return;
             }
 
             if (!UuidEquals(cn.serv_uuid, Switch2InputServiceUuid)) {
-                SW2_LOG_VERBOSE("Ignoring BLE notify for non-Switch2 service: conn_id=%u size=%u", cn.conn_id, cn.size);
+                if (CountNotifyDrop(cn.conn_id, NotifyDrop_ForeignService)) {
+                    FormatGattUuid(g_uuid_text, sizeof(g_uuid_text), cn.serv_uuid);
+                    SW2_LOG_DATA_INFO(cn.data, cn.size, "[S5][DROP][%s] conn_id=%u service=%s (first only)",
+                        NotifyDropNames[NotifyDrop_ForeignService], cn.conn_id, g_uuid_text);
+                }
                 return;
             }
 
             if (UuidEquals(cn.char_uuid, Switch2CommandResponse1CharUuid)) {
-                RecordSwitch2CommandResponse(cn.conn_id, cn.data, cn.size);
-                if (cn.size >= 6) {
-                    SW2_LOG_VERBOSE(
-                        "Switch 2 command response: conn_id=%u cmd=0x%02X status=0x%02X sub=0x%02X ack=0x%02X",
-                        cn.conn_id,
-                        cn.data[0],
-                        cn.data[1],
-                        cn.data[3],
-                        cn.data[5]
-                    );
+                {
+                    std::scoped_lock lk(g_conn_map_lock);
+                    const auto stats = g_connection_stats.find(cn.conn_id);
+                    if (stats != g_connection_stats.end()) ++stats->second.responses;
                 }
-                return;
-            }
-
-            const bool is_universal_report = UuidEquals(cn.char_uuid, Switch2InputReport0x05CharUuid);
-            if (is_universal_report) {
-                SetSwitch2PreferUniversalInput(cn.conn_id, true);
-            }
-
-            const bool prefer_universal = GetSwitch2PreferUniversalInput(cn.conn_id);
-            if (prefer_universal && !is_universal_report) {
-                SW2_LOG_VERBOSE("Ignoring type-specific BLE notify while universal 0x05 stream is active: conn_id=%u", cn.conn_id);
+                RecordSwitch2CommandResponse(cn.conn_id, cn.data, cn.size);
                 return;
             }
 
             controller::ControllerType notify_type = controller::ControllerType_Unknown;
-            if (!is_universal_report) {
-                notify_type = DecodeSwitch2TypeFromInputUuid(cn.char_uuid);
+            NotifyDrop drop = NotifyDrop_Count;
+            {
+                std::scoped_lock lk(g_conn_map_lock);
+                const auto it = g_switch2_gatt_paths.find(cn.conn_id);
+                if (it == g_switch2_gatt_paths.end() || !it->second.ready) {
+                    drop = NotifyDrop_NotReady;
+                } else {
+                    notify_type = it->second.type;
+                    const auto expected = GetSwitch2InputCharUuid(notify_type);
+                    if (expected == nullptr || !UuidEquals(cn.char_uuid, *expected)) drop = NotifyDrop_UnexpectedChar;
+                }
             }
-
-            if (!is_universal_report && notify_type == controller::ControllerType_Unknown) {
-                SW2_LOG_VERBOSE("Ignoring BLE notify for non-input Switch2 characteristic: conn_id=%u size=%u", cn.conn_id, cn.size);
+            if (drop == NotifyDrop_NotReady) {
+                // Expected while the command bootstrap is still running.
+                if (CountNotifyDrop(cn.conn_id, drop)) {
+                    SW2_LOG_DATA_VERBOSE(cn.data, cn.size, "[S5][SKIP][%s] conn_id=%u input before GATT setup finished (first only)",
+                        NotifyDropNames[drop], cn.conn_id);
+                }
                 return;
             }
-
-            controller::ControllerType known_type = controller::GetDiscoveredSwitch2ControllerType(addr);
-            if (known_type == controller::ControllerType_Unknown) {
-                if (notify_type != controller::ControllerType_Unknown) {
-                    known_type = notify_type;
-                    controller::RegisterDiscoveredSwitch2Controller(addr, known_type);
-                    SW2_LOG_INFO("Inferred Switch 2 controller type from input characteristic: type=%u", static_cast<u32>(known_type));
-                } else {
-                    known_type = ResolveSwitch2TypeFromPairedInfo(addr);
-                    if (known_type != controller::ControllerType_Unknown) {
-                        controller::RegisterDiscoveredSwitch2Controller(addr, known_type);
-                        SW2_LOG_INFO("Resolved Switch 2 controller type from paired info for universal report stream: type=%u", static_cast<u32>(known_type));
-                    }
+            if (drop == NotifyDrop_UnexpectedChar) {
+                if (CountNotifyDrop(cn.conn_id, drop)) {
+                    FormatGattUuid(g_uuid_text, sizeof(g_uuid_text), cn.char_uuid);
+                    SW2_LOG_DATA_WARN(cn.data, cn.size, "[S5][DROP][%s] conn_id=%u char=%s type=%s (first only)",
+                        NotifyDropNames[drop], cn.conn_id, g_uuid_text, GetSwitch2ControllerTypeName(notify_type));
                 }
-            } else if (known_type != notify_type) {
-                if (notify_type != controller::ControllerType_Unknown) {
-                    SW2_LOG_WARN("Switch 2 notify type mismatch: discovered=%u notify=%u", static_cast<u32>(known_type), static_cast<u32>(notify_type));
-                }
-            }
-
-            if (known_type == controller::ControllerType_Unknown) {
-                SW2_LOG_WARN("Switch 2 input notify dropped: unresolved controller type conn_id=%u size=%u", cn.conn_id, cn.size);
                 return;
             }
 
             auto device = controller::LocateHandler(addr);
             if (!device) {
-                controller::AttachHandler(addr);
-                device = controller::LocateHandler(addr);
-            }
-
-            if (!device) {
-                SW2_LOG_WARN("No controller handler for BLE notify: conn_id=%u", cn.conn_id);
+                // Initialization belongs to the worker, never this event thread.
+                if (CountNotifyDrop(cn.conn_id, NotifyDrop_NoHandler)) {
+                    SW2_LOG_WARN("[S5][DROP][%s] conn_id=%u ready path without controller handler (first only)",
+                        NotifyDropNames[NotifyDrop_NoHandler], cn.conn_id);
+                }
                 return;
             }
 
-            bluetooth::HidReport report = {};
-            const u16 copy_size = std::min<u16>(cn.size, sizeof(report.data));
-            report.size = copy_size;
-            std::memcpy(report.data, cn.data, copy_size);
+            u8 report_id = 0;
+            switch (notify_type) {
+                case controller::ControllerType_Switch2JoyConL: report_id = 0x07; break;
+                case controller::ControllerType_Switch2JoyConR: report_id = 0x08; break;
+                case controller::ControllerType_Switch2ProController: report_id = 0x09; break;
+                case controller::ControllerType_Switch2NSOGCController: report_id = 0x0A; break;
+                default: return;
+            }
+            if (cn.size < sw2::MinimumPayloadSize(report_id)) {
+                if (CountNotifyDrop(cn.conn_id, NotifyDrop_TooShort)) {
+                    SW2_LOG_DATA_WARN(cn.data, cn.size, "[S5][DROP][%s] conn_id=%u report=0x%02X minimum=%u (check MTU) (first only)",
+                        NotifyDropNames[NotifyDrop_TooShort], cn.conn_id, report_id,
+                        static_cast<u32>(sw2::MinimumPayloadSize(report_id)));
+                }
+                return;
+            }
 
-            bluetooth::HidReportEventInfo event_info = {};
+            // This callback has one consumer (mc::EventThread). Avoid two large
+            // overlapping automatic report buffers on its small stack.
+            static bluetooth::HidReportEventInfo event_info = {};
             event_info.data_report.v9.res = 0;
             event_info.data_report.v9.proto_mode = 0;
             event_info.data_report.v9.addr = addr;
-            std::memcpy(&event_info.data_report.v9.report, &report, sizeof(report));
+            auto &report = event_info.data_report.v9.report;
+            report.size = cn.size + 1;
+            report.data[0] = report_id;
+            std::memcpy(report.data + 1, cn.data, cn.size);
 
-            SW2_LOG_VERBOSE("BLE notify routed to controller: conn_id=%u size=%u", cn.conn_id, copy_size);
-            if (R_FAILED(device->HandleDataReportEvent(&event_info))) {
-                SW2_LOG_WARN("HandleDataReportEvent failed for BLE notify: conn_id=%u", cn.conn_id);
+            const Result rc = device->HandleDataReportEvent(&event_info);
+            if (R_FAILED(rc)) {
+                if (CountNotifyDrop(cn.conn_id, NotifyDrop_HandlerError)) {
+                    SW2_LOG_WARN("[S5][DROP][%s] conn_id=%u report=0x%02X forwarding to HID event buffer failed " SW2_RC_FMT " (first only)",
+                        NotifyDropNames[NotifyDrop_HandlerError], cn.conn_id, report_id, SW2_RC_ARGS(rc));
+                }
+                return;
+            }
+
+            bool log_first = false;
+            u32 delivered = 0;
+            {
+                std::scoped_lock lk(g_conn_map_lock);
+                const auto stats = g_connection_stats.find(cn.conn_id);
+                if (stats != g_connection_stats.end()) {
+                    delivered = ++stats->second.delivered;
+                    log_first = !stats->second.first_input_logged;
+                    stats->second.first_input_logged = true;
+                }
+            }
+            if (log_first) {
+                SW2_LOG_DATA_INFO(cn.data, cn.size, "[S5][OK][INPUT-FIRST] conn_id=%u report=0x%02X forwarded to HID event buffer (Horizon registration not verified)",
+                    cn.conn_id, report_id);
+            } else if (delivered != 0 && (delivered % InputAliveLogInterval) == 0) {
+                SW2_LOG_VERBOSE("[S5][INPUT-ALIVE] conn_id=%u delivered=%u", cn.conn_id, delivered);
+            }
+        }
+
+        // Logs BLE events that the bridge does not act on, for tracked connections only.
+        void LogOtherBleEvent(bluetooth::BleEventType type, const bluetooth::BleEventInfo &info) {
+            auto tracked = [](u32 conn_id) {
+                std::scoped_lock lk(g_conn_map_lock);
+                return g_conn_map.find(conn_id) != g_conn_map.end();
+            };
+
+            switch (type) {
+                case BtdrvBleEventType_ConnectionUpdate:
+                    if (tracked(info.connection_update.conn_id)) {
+                        SW2_LOG_INFO("[S1][BLE-EVENT] ConnectionUpdate conn_id=%u result=0x%08X interval=%u latency=%u timeout=%u",
+                            info.connection_update.conn_id, info.connection_update.result, info.connection_update.conn_interval,
+                            info.connection_update.conn_latency, info.connection_update.supervision_tout);
+                    }
+                    break;
+                case BtdrvBleEventType_ClientConfigureMtu:
+                    if (tracked(info.client_configure_mtu.conn_id)) {
+                        SW2_LOG_INFO("[S1][BLE-EVENT] ClientConfigureMtu conn_id=%u result=0x%08X mtu=%u",
+                            info.client_configure_mtu.conn_id, info.client_configure_mtu.result, info.client_configure_mtu.mtu);
+                    }
+                    break;
+                case BtdrvBleEventType_ClientCacheSave:
+                    if (tracked(info.client_cache_save.conn_id)) {
+                        SW2_LOG_INFO("[S1][BLE-EVENT] ClientCacheSave conn_id=%u result=0x%08X attributes=%u",
+                            info.client_cache_save.conn_id, info.client_cache_save.result, info.client_cache_save.count);
+                    }
+                    break;
+                case BtdrvBleEventType_ClientCacheLoad:
+                    if (tracked(info.client_cache_load.conn_id)) {
+                        SW2_LOG_INFO("[S1][BLE-EVENT] ClientCacheLoad conn_id=%u result=0x%08X",
+                            info.client_cache_load.conn_id, info.client_cache_load.result);
+                    }
+                    break;
+                default:
+                    SW2_LOG_VERBOSE("[S1][BLE-EVENT] %s(%u)", GetBleEventTypeName(type), static_cast<u32>(type));
+                    break;
             }
         }
 
@@ -834,7 +1178,7 @@ namespace ams::bluetooth::ble {
 
     void SignalInitialized() {
         g_init_event.Signal();
-        StartSwitch2ConnectWorkerIfNeeded();
+        if (ams::mitm::GetGlobalConfig()->bluetooth.enable_switch2_experimental) StartSwitch2ConnectWorkerIfNeeded();
     }
 
     void WaitInitialized() {
@@ -857,7 +1201,7 @@ namespace ams::bluetooth::ble {
         std::scoped_lock lk(g_event_data_lock);
 
         *type = g_current_event_type;
-        std::memcpy(buffer, &g_event_info, size);
+        std::memcpy(buffer, &g_event_info, std::min(size, sizeof(g_event_info)));
 
         g_data_read_event.Signal();
         
@@ -873,30 +1217,80 @@ namespace ams::bluetooth::ble {
     }
 
     Result WriteSwitch2GattDataReport(const bluetooth::Address &address, const bluetooth::HidReport *report) {
+        if (report == nullptr) {
+            SW2_LOG_WARN("[S4][FAIL][CMD-INVALID] null report");
+            return Sw2Error(sw2::Error::InvalidCommand);
+        }
+        if (report->size > sizeof(report->data) || !IsSwitch2CommandRequest(report) || report->size != 8u + report->data[5]) {
+            SW2_LOG_DATA_WARN(report->data, std::min<size_t>(report->size, sizeof(report->data)),
+                "[S4][FAIL][CMD-INVALID] frame is not a well-formed 91 01 command (expected size 8 + data[5])");
+            return Sw2Error(sw2::Error::InvalidCommand);
+        }
+        const u8 cmd = report->data[0];
+        const u8 sub = report->data[3];
+        // Arm BEFORE the IPC write: a fast response may arrive before it returns.
+        // Serialize commands because this protocol has no transaction identifier.
+        std::scoped_lock write_lock(g_switch2_write_lock);
         u32 conn_id = 0;
         if (!HasBleConnection(address, &conn_id)) {
-            SW2_LOG_WARN("WriteSwitch2GattDataReport: missing BLE connection mapping (size=%u)", report->size);
-            return MAKERESULT(0x123, 1);
+            SW2_LOG_WARN("[S4][FAIL][CMD-WRITE] cmd=0x%02X sub=0x%02X no BLE connection for mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                cmd, sub,
+                address.address[0], address.address[1], address.address[2],
+                address.address[3], address.address[4], address.address[5]);
+            return Sw2Error(sw2::Error::StaleConnection);
         }
 
-        const Result rc = WriteSwitch2GattDataReportImpl(conn_id, report);
-        if (R_FAILED(rc)) {
-            SW2_LOG_WARN("WriteSwitch2GattDataReport failed: conn_id=%u rc=0x%08X size=%u", conn_id, static_cast<u32>(rc.GetValue()), report->size);
-        }
-
-        if (R_SUCCEEDED(rc) && ShouldWaitForSwitch2CommandResponse(report)) {
-            const bool got_response = WaitForSwitch2CommandResponse(conn_id, report->data[0], report->data[3], 300);
-            if (!got_response) {
-                SW2_LOG_WARN(
-                    "Switch 2 command response timeout: conn_id=%u cmd=0x%02X sub=0x%02X",
-                    conn_id,
-                    report->data[0],
-                    report->data[3]
-                );
+        const bool wait_response = ShouldWaitForSwitch2CommandResponse(report);
+        bool have_state = false;
+        {
+            std::scoped_lock lk(g_switch2_cmd_response_lock);
+            const auto it = g_switch2_cmd_responses.find(conn_id);
+            if (it != g_switch2_cmd_responses.end()) {
+                it->second = {wait_response, false, cmd, sub, 0};
+                have_state = true;
             }
         }
+        if (!have_state) {
+            SW2_LOG_WARN("[S4][FAIL][CMD-WRITE] conn_id=%u cmd=0x%02X sub=0x%02X no command state (connection being torn down?)", conn_id, cmd, sub);
+            CountCommand(conn_id, false);
+            return Sw2Error(sw2::Error::CommandStateMissing);
+        }
+        ON_SCOPE_EXIT {
+            std::scoped_lock lk(g_switch2_cmd_response_lock);
+            const auto it = g_switch2_cmd_responses.find(conn_id);
+            if (it != g_switch2_cmd_responses.end()) it->second.awaiting = false;
+        };
 
-        return rc;
+        SW2_LOG_DATA_INFO(report->data, report->size, "[S4][CMD-TX] conn_id=%u cmd=0x%02X sub=0x%02X wait_ack=%u",
+            conn_id, cmd, sub, wait_response ? 1u : 0u);
+
+        const u64 start_ns = GetCurrentTimeNs();
+        const Result rc = WriteSwitch2GattDataReportImpl(conn_id, report);
+        if (R_FAILED(rc)) {
+            SW2_LOG_WARN("[S4][FAIL][CMD-WRITE] conn_id=%u cmd=0x%02X sub=0x%02X " SW2_RC_FMT, conn_id, cmd, sub, SW2_RC_ARGS(rc));
+            CountCommand(conn_id, false);
+            return rc;
+        }
+
+        if (!wait_response) {
+            SW2_LOG_VERBOSE("[S4][OK][CMD-WRITE] conn_id=%u cmd=0x%02X sub=0x%02X no ack expected", conn_id, cmd, sub);
+            CountCommand(conn_id, true);
+            R_SUCCEED();
+        }
+
+        u8 ack = 0;
+        const Result response_rc = WaitForSwitch2CommandResponse(conn_id, 1000, &ack);
+        const u32 elapsed_ms = static_cast<u32>((GetCurrentTimeNs() - start_ns) / 1'000'000ull);
+        if (R_FAILED(response_rc)) {
+            SW2_LOG_WARN("[S4][FAIL][CMD-ACK] conn_id=%u cmd=0x%02X sub=0x%02X ack=0x%02X elapsed_ms=%u " SW2_RC_FMT,
+                conn_id, cmd, sub, ack, elapsed_ms, SW2_RC_ARGS(response_rc));
+            CountCommand(conn_id, false);
+            return response_rc;
+        }
+
+        SW2_LOG_INFO("[S4][OK][CMD-ACK] conn_id=%u cmd=0x%02X sub=0x%02X ack=0x%02X elapsed_ms=%u", conn_id, cmd, sub, ack, elapsed_ms);
+        CountCommand(conn_id, true);
+        R_SUCCEED();
     }
 
     void HandleEvent() {
@@ -905,31 +1299,7 @@ namespace ams::bluetooth::ble {
             R_ABORT_UNLESS(btdrvGetBleManagedEventInfo(&g_event_info, sizeof(bluetooth::BleEventInfo), &g_current_event_type));
         }
 
-        SW2_LOG_INFO("BLE Event: type=%u (%s)", (u32)g_current_event_type, GetBleEventTypeName(g_current_event_type));
-        LogBleEventSummary(g_current_event_type, g_event_info);
-        
-        // Log raw data (at most 64 bytes)
-        u8 *raw = reinterpret_cast<u8*>(&g_event_info);
-        char hex[256];
-        size_t pos = 0;
-        for (size_t i = 0; i < sizeof(bluetooth::BleEventInfo) && i < 64 && pos + 3 < sizeof(hex); ++i) {
-            pos += std::snprintf(hex + pos, sizeof(hex) - pos, "%02X ", raw[i]);
-        }
-        SW2_LOG_VERBOSE("BLE Data: %s", hex);
-
-        // Switch 2 controllers communicate over BLE GATT. This handler currently only
-        // observes/forwards managed BLE events and logs them for debugging. The full
-        // integration point for Switch 2 support lives here: a BLE GATT bridge needs to
-        // (1) detect Switch 2 advertisements, (2) connect as GATT central, (3) discover
-        // services, (4) subscribe to the controller-specific default input
-        // characteristic (0x07/0x08/0x09/0x0A on handle 0x000E), and (5) on each
-        // notification build a bluetooth::HidReport from the raw payload and route it
-        // to the matching controller's ProcessInputData(). Outbound init/LED commands
-        // built by Switch2Controller::MakeSwitch2Command() must be written to the
-        // command characteristic (649d4ac9-8eb7-4e6c-af44-1ea54fe5f005).
-        ScanForSwitch2(g_event_info);
-
-        switch (g_current_event_type) {
+        if (ams::mitm::GetGlobalConfig()->bluetooth.enable_switch2_experimental) switch (g_current_event_type) {
             case BtdrvBleEventType_ScanResult:
                 HandleScanResultEvent(g_event_info);
                 break;
@@ -943,6 +1313,7 @@ namespace ams::bluetooth::ble {
                 HandleClientNotifyEvent(g_event_info);
                 break;
             default:
+                LogOtherBleEvent(g_current_event_type, g_event_info);
                 break;
         }
 

@@ -12,11 +12,17 @@
 
 # Mission Control
 
+> **Local Switch 2 development fork — not a completed Joy-Con 2 release.**
+> Includes the upstream 22.5.0 patch/SDK backport. Switch 2 GATT diagnostics are
+> opt-in and lack Horizon gamepad registration and validated scan acquisition.
+> Read [SWITCH2_STATUS.md](SWITCH2_STATUS.md) for the firmware scope, build,
+> installation, limitations and hardware acceptance checklist.
+
 Use controllers from other consoles natively on your Nintendo Switch via Bluetooth. No dongles or other external hardware neccessary.
 
 ### Features
 
-* Supports all Switch firmware versions.
+* This fork includes the known upstream patches through 22.5.0; later firmware is not certified.
 * Connect up to 8 non-switch Bluetooth controllers simultaneously without any additional hardware.
 * Make use of native HOS menus for controller pairing, button remapping (firmware 10.0.0+) etc.
 * Support for rumble and motion controls (compatible controllers only)
@@ -84,6 +90,7 @@ Use controllers from other consoles natively on your Nintendo Switch via Bluetoo
 ### Requirements
 
 * Hackable Nintendo Switch running an up-to-date version of [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere/releases) custom firmware. Other custom firmwares are ***not supported***.
+* Firmware 22.5.0 requires Atmosphère 1.11.2 or newer; use a release compatible with the installed firmware.
 * Compatible Bluetooth controller
 
 ### Installation

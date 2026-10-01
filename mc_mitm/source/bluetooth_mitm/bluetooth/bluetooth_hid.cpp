@@ -115,7 +115,7 @@ namespace ams::bluetooth::hid {
         switch (event_info->connection.v1.status) {
             case BtdrvHidConnectionStatusOld_Opened:
                 SW2_LOG_INFO("HID Connection (v1): opened addr=%s", addr_str);
-                controller::AttachHandler(event_info->connection.v1.addr);
+                static_cast<void>(controller::AttachHandler(event_info->connection.v1.addr));
                 break;
             case BtdrvHidConnectionStatusOld_Closed:
                 SW2_LOG_INFO("HID Connection (v1): closed addr=%s", addr_str);
@@ -137,7 +137,7 @@ namespace ams::bluetooth::hid {
         switch (event_info->connection.v12.status) {
             case BtdrvHidConnectionStatus_Opened:
                 SW2_LOG_INFO("HID Connection: opened addr=%s", addr_str);
-                controller::AttachHandler(event_info->connection.v12.addr);
+                static_cast<void>(controller::AttachHandler(event_info->connection.v12.addr));
                 break;
             case BtdrvHidConnectionStatus_Closed:
                 SW2_LOG_INFO("HID Connection: closed addr=%s", addr_str);

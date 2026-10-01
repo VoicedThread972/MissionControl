@@ -63,7 +63,8 @@ namespace ams::controller {
         u8 X            : 1;
         u8 B            : 1;
         u8 A            : 1;
-        u8              : 2; // SR, SL (Right Joy)
+        u8 SR_right     : 1;
+        u8 SL_right     : 1;
         u8 R            : 1;
         u8 ZR           : 1;
 
@@ -79,10 +80,13 @@ namespace ams::controller {
         u8 dpad_up      : 1;
         u8 dpad_right   : 1;
         u8 dpad_left    : 1;
-        u8              : 2; // SR, SL (Left Joy)
+        u8 SR_left      : 1;
+        u8 SL_left      : 1;
         u8 L            : 1;
         u8 ZL           : 1;
     } PACKED;
+
+    static_assert(sizeof(SwitchButtonData) == 3);
 
     struct Switch6AxisCalibrationData {
         struct {

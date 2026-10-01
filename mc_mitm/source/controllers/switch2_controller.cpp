@@ -16,6 +16,7 @@
 #include "switch2_controller.hpp"
 #include "controller_utils.hpp"
 #include "switch2_debug.hpp"
+#include "switch2_protocol.hpp"
 #include <stratosphere.hpp>
 
 namespace ams::controller {
@@ -93,73 +94,147 @@ namespace ams::controller {
     Result Switch2Controller::Initialize() {
         R_TRY(this->EmulatedSwitchController::Initialize());
 
-        SW2_LOG_INFO("Initializing Switch 2 controller (vid=0x%04x, pid=0x%04x)", m_id.vid, m_id.pid);
-
         bluetooth::HidReport report;
+        u32 pairing_step = 1;
+
+        SW2_LOG_INFO("[S4][PAIR-00] Start command bootstrap (no persistent bonding) vid=0x%04X pid=0x%04X", m_id.vid, m_id.pid);
+
+        auto send_pairing_step = [&](const char *instruction, u8 cmd_id, u8 sub_id, const u8 *data, u8 data_len, u32 delay_ms) -> Result {
+            const u32 current_step = pairing_step++;
+
+            SW2_LOG_INFO("[S4][PAIR-%02u] %s", current_step, instruction);
+            this->MakeSwitch2Command(&report, cmd_id, sub_id, data, data_len);
+
+            const Result rc = this->WriteDataReport(&report);
+            if (R_FAILED(rc)) {
+                SW2_LOG_WARN("[S4][FAIL][PAIR-%02u] cmd=0x%02X sub=0x%02X " SW2_RC_FMT " (bootstrap aborted; see preceding [S4][FAIL][CMD-*])",
+                    current_step, cmd_id, sub_id, SW2_RC_ARGS(rc));
+                return rc;
+            }
+
+            // WriteDataReport returns only after a successful ack for commands that expect one.
+            SW2_LOG_INFO("[S4][OK][PAIR-%02u] cmd=0x%02X sub=0x%02X done", current_step, cmd_id, sub_id);
+
+            if (delay_ms != 0) {
+                os::SleepThread(ams::TimeSpan::FromMilliSeconds(delay_ms));
+            }
+
+            R_SUCCEED();
+        };
 
         // Observed early bootstrap commands from the captured Bluetooth sequence.
-        this->MakeSwitch2Command(&report, 0x07, 0x01, nullptr, 0);
-        R_TRY(this->WriteDataReport(&report));
-        os::SleepThread(ams::TimeSpan::FromMilliSeconds(20));
+        R_TRY(send_pairing_step(
+            "Send observed bootstrap command 07/01 (purpose unknown).",
+            0x07,
+            0x01,
+            nullptr,
+            0,
+            20
+        ));
+
+        // Pairing is optional for GATT input (documentation/bluetooth_interface.md).
+        // Do not commit trace keys or overwrite the controller's saved hosts.
+        // Persistent bonding requires verified B1/B2, host-side key storage and
+        // a supported link-encryption path; none may be replaced by replay data.
 
         if (m_id.pid == 0x2060 || m_id.pid == 0x2061 || m_id.pid == 0x2064) {
-            this->MakeSwitch2Command(&report, 0x10, 0x01, nullptr, 0);
-            R_TRY(this->WriteDataReport(&report));
-            os::SleepThread(ams::TimeSpan::FromMilliSeconds(20));
+            R_TRY(send_pairing_step(
+                "Request firmware information.",
+                0x10,
+                0x01,
+                nullptr,
+                0,
+                20
+            ));
         }
 
-        this->MakeSwitch2Command(&report, 0x16, 0x01, nullptr, 0);
-        R_TRY(this->WriteDataReport(&report));
-        os::SleepThread(ams::TimeSpan::FromMilliSeconds(20));
+        R_TRY(send_pairing_step(
+            "Send observed bootstrap command 16/01 (purpose unknown).",
+            0x16,
+            0x01,
+            nullptr,
+            0,
+            20
+        ));
 
         const u8 vibration_sample[] = { 0x03, 0x00, 0x00, 0x00 };
-        this->MakeSwitch2Command(&report, 0x0A, 0x02, vibration_sample, sizeof(vibration_sample));
-        R_TRY(this->WriteDataReport(&report));
-        os::SleepThread(ams::TimeSpan::FromMilliSeconds(50));
+        R_TRY(send_pairing_step(
+            "Play vibration sample 3 (not calibration).",
+            0x0A,
+            0x02,
+            vibration_sample,
+            sizeof(vibration_sample),
+            50
+        ));
 
         // Set Player LEDs. The captured sequence sends an 8-byte LED payload.
         const u8 led_data[] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-        this->MakeSwitch2Command(&report, 0x09, 0x07, led_data, sizeof(led_data));
-        R_TRY(this->WriteDataReport(&report));
-        os::SleepThread(ams::TimeSpan::FromMilliSeconds(50));
+        R_TRY(send_pairing_step(
+            "Set player LED 1 (not proof of Horizon registration).",
+            0x09,
+            0x07,
+            led_data,
+            sizeof(led_data),
+            50
+        ));
 
         const u8 feature_mask[] = { this->GetFeatureMask(), 0x00, 0x00, 0x00 };
 
-        this->MakeSwitch2Command(&report, 0x0C, 0x02, feature_mask, sizeof(feature_mask));
-        R_TRY(this->WriteDataReport(&report));
-        os::SleepThread(ams::TimeSpan::FromMilliSeconds(50));
+        R_TRY(send_pairing_step(
+            "Apply feature mask phase 1.",
+            0x0C,
+            0x02,
+            feature_mask,
+            sizeof(feature_mask),
+            50
+        ));
 
-        this->MakeSwitch2Command(&report, 0x0C, 0x04, feature_mask, sizeof(feature_mask));
-        R_TRY(this->WriteDataReport(&report));
+        R_TRY(send_pairing_step(
+            "Apply feature mask phase 2; no pairing keys are stored.",
+            0x0C,
+            0x04,
+            feature_mask,
+            sizeof(feature_mask),
+            0
+        ));
+
+        SW2_LOG_INFO("[S4][OK][GATT-INIT] command bootstrap acknowledged; not persistent bonding or Horizon registration");
 
         R_SUCCEED();
     }
 
     void Switch2Controller::ProcessInputData(const bluetooth::HidReport *report) {
-        // Joy2Win and newer firmware paths primarily stream universal report 0x05.
-        // Prefer decoding that format whenever we have enough bytes, then fall back
-        // to type-specific default reports for shorter legacy payloads.
-        if (report->size >= Switch2InputReport0x05MinLength) {
-            this->MapInputReport0x05(report);
+        if (report->size < 1 || report->size > sizeof(report->data) ||
+            !switch2::ValidInput(report->data[0], m_id.pid, report->size - 1)) {
+            if (!m_logged_invalid_input) {
+                m_logged_invalid_input = true;
+                SW2_LOG_WARN("[S5][DROP][INVALID-INPUT] report=0x%02X pid=0x%04X size=%u rejected by decoder (first only)",
+                    report->size >= 1 ? report->data[0] : 0, m_id.pid, report->size);
+            }
             return;
         }
 
-        switch (m_id.pid) {
-            case 0x2060:
-                this->MapInputReport0x07(report);
-                break;
-            case 0x2061:
-                this->MapInputReport0x08(report);
-                break;
-            case 0x2062:
-                this->MapInputReport0x09(report);
-                break;
-            case 0x2064:
-                this->MapInputReport0x0A(report);
-                break;
-            default:
-                this->MapInputReport0x05(report);
-                break;
+        // The BLE bridge restores the report ID; decoders below use payload
+        // offsets from the documentation. This scratch buffer is used only
+        // under SwitchController::m_input_mutex, like the rest of input state.
+        m_payload_report.size = report->size - 1;
+        std::memcpy(m_payload_report.data, report->data + 1, m_payload_report.size);
+        switch (report->data[0]) {
+            case 0x05: this->MapInputReport0x05(&m_payload_report); break;
+            case 0x07: this->MapInputReport0x07(&m_payload_report); break;
+            case 0x08: this->MapInputReport0x08(&m_payload_report); break;
+            case 0x09: this->MapInputReport0x09(&m_payload_report); break;
+            case 0x0A: this->MapInputReport0x0A(&m_payload_report); break;
+        }
+
+        // Decoded state changes prove the mapping works on hardware without logging every packet.
+        u32 buttons = 0;
+        std::memcpy(&buttons, &m_buttons, sizeof(m_buttons));
+        if (buttons != m_last_logged_buttons) {
+            m_last_logged_buttons = buttons;
+            SW2_LOG_VERBOSE("[S5][INPUT-CHANGE] report=0x%02X buttons=%06X ls=%u,%u rs=%u,%u battery=%u",
+                report->data[0], buttons,
+                m_left_stick.GetX(), m_left_stick.GetY(), m_right_stick.GetX(), m_right_stick.GetY(), m_battery);
         }
     }
 
@@ -199,6 +274,10 @@ namespace ams::controller {
         m_buttons.rstick_press = btn.rstick_press;
         m_buttons.home         = btn.home;
         m_buttons.capture      = btn.capture;
+        m_buttons.SL_left      = btn.SL_left;
+        m_buttons.SR_left      = btn.SR_left;
+        m_buttons.SL_right     = btn.SL_right;
+        m_buttons.SR_right     = btn.SR_right;
 
         m_left_stick.SetData(
             Unpack12BitStickX(src->left_stick),
@@ -213,6 +292,10 @@ namespace ams::controller {
             const u16 voltage_mv = static_cast<u16>(report->data[Switch2InputReport0x05Offset_BatteryVoltage] |
                                                    (report->data[Switch2InputReport0x05Offset_BatteryVoltage + 1] << 8));
             m_battery = convert_battery_voltage(voltage_mv);
+        }
+        if (m_id.pid == 0x2064 && report->size > Switch2InputReport0x05Offset_TriggerR) {
+            m_buttons.ZL |= report->data[Switch2InputReport0x05Offset_TriggerL] > Switch2TriggerThreshold;
+            m_buttons.ZR |= report->data[Switch2InputReport0x05Offset_TriggerR] > Switch2TriggerThreshold;
         }
     }
 
@@ -236,6 +319,8 @@ namespace ams::controller {
         m_buttons.minus        = (b0 & 0x40) != 0;
         m_buttons.lstick_press = (b0 & 0x80) != 0;
         m_buttons.capture      = (b1 & 0x01) != 0;
+        m_buttons.SR_left      = (b1 & 0x40) != 0;
+        m_buttons.SL_left      = (b1 & 0x80) != 0;
 
         m_left_stick.SetData(
             Unpack12BitStickX(&report->data[0x05]),
@@ -263,6 +348,8 @@ namespace ams::controller {
         m_buttons.plus         = (b0 & 0x40) != 0;
         m_buttons.rstick_press = (b0 & 0x80) != 0;
         m_buttons.home         = (b1 & 0x01) != 0;
+        m_buttons.SR_right     = (b1 & 0x40) != 0;
+        m_buttons.SL_right     = (b1 & 0x80) != 0;
 
         m_right_stick.SetData(
             Unpack12BitStickX(&report->data[0x05]),
@@ -362,7 +449,7 @@ namespace ams::controller {
     // --- NSO GameCube Controller 2 ---
 
     void NSOGCController2Controller::ProcessInputData(const bluetooth::HidReport *report) {
-        this->MapInputReport0x0A(report);
+        this->Switch2Controller::ProcessInputData(report);
     }
 
 }

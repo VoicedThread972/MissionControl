@@ -1,7 +1,7 @@
 .assets/
 .vscode/
 .patches/
-tests/
+tests/.build/
 dist/
 mc_mitm/build/
 mc_mitm/out/

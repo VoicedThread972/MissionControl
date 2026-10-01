@@ -92,6 +92,8 @@ namespace ams::mitm {
                     std::strncpy(config->bluetooth.host_name, value, sizeof(config->bluetooth.host_name));
                 } else if (strcasecmp(name, "host_address") == 0) {
                     ParseBluetoothAddress(value, &config->bluetooth.host_address);
+                } else if (strcasecmp(name, "enable_switch2_experimental") == 0) {
+                    ParseBoolean(value, &config->bluetooth.enable_switch2_experimental);
                 }
             } else if (strcasecmp(section, "misc") == 0) {
                 if (strcasecmp(name, "analog_trigger_activation_threshold") == 0) {

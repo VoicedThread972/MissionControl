@@ -1,12 +1,10 @@
 PROJECT_NAME := MissionControl
 MC_MITM_TID := 010000000000bd00
 
-GIT_BRANCH := $(shell git symbolic-ref --short HEAD | sed s/[^a-zA-Z0-9_-]/_/g)
-GIT_HASH := $(shell git rev-parse --short HEAD)
-GIT_TAG := $(shell git describe --tags `git rev-list --tags --max-count=1`)
-
-VERSION := $(shell printf "0x%02X%02X%02X" $(shell echo "$(GIT_TAG)" | sed -E 's/^v([0-9]+).([0-9]+).([0-9]+)/\1 \2 \3/g'))
-BUILD_VERSION := $(GIT_TAG:v%=%)-$(GIT_BRANCH)-$(GIT_HASH)
+GIT_HASH := $(shell git rev-parse --short HEAD)$(shell git diff --quiet HEAD -- . || printf '%s' '-dirty')
+# Explicit backport baseline: fetching a tag must not change the build version.
+VERSION := 0x000F02
+BUILD_VERSION := 0.15.2-sw2-experimental-$(GIT_HASH)
 BUILD_DATE := $(shell date)
 
 TARGETS := mcmitm_version.cpp mc_mitm
@@ -16,8 +14,11 @@ all: $(TARGETS)
 mcmitm_version.cpp: .git/HEAD .git/index
 	echo "namespace ams::mc { unsigned int mc_version = $(VERSION); const char *mc_build_name = \"$(BUILD_VERSION)\"; const char *mc_build_date = \"$(BUILD_DATE)\"; }" > mc_mitm/source/$@
 
-mc_mitm:
+mc_mitm: mcmitm_version.cpp
 	$(MAKE) -C $@
+
+test:
+	$(MAKE) -C tests test
 
 clean:
 	$(MAKE) -C mc_mitm clean
@@ -44,7 +45,10 @@ dist: all
 	mkdir -p dist/config/MissionControl
 	mkdir -p dist/config/MissionControl/controllers
 	cp mc_mitm/config.ini dist/config/MissionControl/missioncontrol.ini.template
+	cp SWITCH2_STATUS.md dist/SWITCH2_STATUS.md
+	cp LICENSE dist/LICENSE
+	cd dist; find . -type f ! -name SHA256SUMS -exec sha256sum {} \; > SHA256SUMS
 
 	cd dist; zip -r $(PROJECT_NAME)-$(BUILD_VERSION).zip ./*; cd ../;
 
-.PHONY: all clean dist $(TARGETS)
+.PHONY: all clean dist test $(TARGETS)

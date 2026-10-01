@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+#include <algorithm>
 
 namespace ams::controller {
 
@@ -25,10 +26,27 @@ namespace ams::controller {
         constexpr const char *LogPath = "sdmc:/config/MissionControl/switch2_debug.log";
         constexpr const char *BuildSignature = __DATE__ " " __TIME__;
 
+        bool IsAllowedDiagnosticMessage(const char *msg) {
+            if (msg == nullptr) {
+                return false;
+            }
+
+            return std::strstr(msg, "[S0]") != nullptr ||
+                   std::strstr(msg, "[S1]") != nullptr ||
+                   std::strstr(msg, "[S2]") != nullptr ||
+                   std::strstr(msg, "[S3]") != nullptr ||
+                   std::strstr(msg, "[S4]") != nullptr ||
+                   std::strstr(msg, "[S5]") != nullptr;
+        }
+
+        // All mutable logger state and formatting buffers are protected by g_log_mutex.
         os::SdkMutex   g_log_mutex;
         bool           g_initialized = false;
         Switch2LogLevel g_log_level  = Switch2LogLevel::Verbose;
         u64            g_log_sequence = 0;
+        char           g_message[448];
+        char           g_line[512];
+        char           g_tick_line[24];
 
         Result EnsureLogFileExists() {
             R_TRY_CATCH(fs::CreateFile(LogPath, 0)) {
@@ -38,8 +56,8 @@ namespace ams::controller {
             R_SUCCEED();
         }
 
-        // Write raw bytes to the log file with a short-lived handle so SD tools
-        // can inspect/copy/delete the log while the sysmodule is still running.
+        // Caller must hold g_log_mutex. File-only, synchronous, best-effort writes;
+        // short-lived handles allow SD tools access between writes, not coordination.
         void WriteRaw(const char *buf, size_t len) {
             if (!g_initialized || len == 0) return;
 
@@ -55,48 +73,48 @@ namespace ams::controller {
             static_cast<void>(fs::WriteFile(file, offset, buf, len, fs::WriteOption::Flush));
         }
 
-        void FormatAddress(char *buf, size_t bufsz, const bluetooth::Address &addr) {
-            std::snprintf(buf, bufsz, "%02X:%02X:%02X:%02X:%02X:%02X",
-                addr.address[0], addr.address[1], addr.address[2],
-                addr.address[3], addr.address[4], addr.address[5]);
-        }
-
         void WriteSessionHeader() {
-            // Keep header formatting stack usage small: the init thread runs with
-            // a 0x1000-byte stack and large local buffers can overflow it.
-            char header[256];
-            const u64 session_tick = os::GetSystemTick().GetInt64Value();
-
-            int len = std::snprintf(
-                header,
-                sizeof(header),
+            // Caller must hold g_log_mutex; shared scratch storage keeps tiny stacks small.
+            static constexpr const char kHeaderPrefix[] =
                 "=== Switch2 Debug Log ===\n"
-                "Build Signature: %s\n"
-                "Session Start Tick: %016llX\n"
-                "Log Format Version: 2\n",
-                BuildSignature,
-                static_cast<unsigned long long>(session_tick)
-            );
+                "Build Signature: ";
+            static constexpr const char kHeaderMid[] =
+                "\nSession Start Tick: ";
+            static constexpr const char kHeaderSuffix[] =
+                "\nLog Format Version: 3\n"
+                "Stages: S0=session S1=ble-scan/events S2=identify S3=connect/gatt S4=commands S5=input\n";
 
-            if (len > 0) {
-                WriteRaw(header, static_cast<size_t>(len));
+            WriteRaw(kHeaderPrefix, std::strlen(kHeaderPrefix));
+            WriteRaw(BuildSignature, std::strlen(BuildSignature));
+            WriteRaw(kHeaderMid, std::strlen(kHeaderMid));
+
+            const u64 session_tick = os::GetSystemTick().GetInt64Value();
+            const int tick_len = std::snprintf(g_tick_line, sizeof(g_tick_line), "%016llX", static_cast<unsigned long long>(session_tick));
+            if (tick_len > 0) {
+                const size_t written = static_cast<size_t>(tick_len) < sizeof(g_tick_line)
+                    ? static_cast<size_t>(tick_len) : sizeof(g_tick_line) - 1;
+                WriteRaw(g_tick_line, written);
             }
+
+            WriteRaw(kHeaderSuffix, std::strlen(kHeaderSuffix));
         }
 
     }
 
     void Switch2DebugInit(Switch2LogLevel level) {
         std::scoped_lock lk(g_log_mutex);
+        // A failed reinitialization must not leave the previous session enabled.
+        g_initialized = false;
         g_log_level = level;
+        g_log_sequence = 0;
 
-        // Ensure directory exists
+        // Leave logging disabled on any setup failure; a missing old log is harmless.
         if (R_FAILED(fs::EnsureDirectory("sdmc:/config/MissionControl"))) return;
 
-        // Delete old log and create fresh
-        static_cast<void>(fs::DeleteFile(LogPath));
+        const Result delete_result = fs::DeleteFile(LogPath);
+        if (R_FAILED(delete_result) && !fs::ResultPathNotFound::Includes(delete_result)) return;
         if (R_FAILED(fs::CreateFile(LogPath, 0))) return;
         g_initialized = true;
-        g_log_sequence = 0;
 
         WriteSessionHeader();
     }
@@ -106,71 +124,91 @@ namespace ams::controller {
         g_initialized = false;
     }
 
+    namespace {
+
+        // Caller must hold g_log_mutex. Appends " len=N data=HEX" to g_message.
+        size_t AppendHexLocked(size_t used, const u8 *data, size_t size) {
+            constexpr size_t MaxHexBytes = 64;
+            static constexpr char Digits[] = "0123456789ABCDEF";
+
+            const int n = std::snprintf(g_message + used, sizeof(g_message) - used, " len=%u data=", static_cast<unsigned int>(size));
+            if (n < 0) return used;
+            used = std::min(used + static_cast<size_t>(n), sizeof(g_message) - 1);
+
+            const size_t shown = data != nullptr ? std::min(size, MaxHexBytes) : 0;
+            for (size_t i = 0; i < shown && used + 2 < sizeof(g_message); ++i) {
+                g_message[used++] = Digits[data[i] >> 4];
+                g_message[used++] = Digits[data[i] & 0xF];
+            }
+            if (size > shown && used + 3 < sizeof(g_message)) {
+                g_message[used++] = '.';
+                g_message[used++] = '.';
+                g_message[used++] = '.';
+            }
+            g_message[used] = '\0';
+            return used;
+        }
+
+        void LogImpl(Switch2LogLevel level, bool has_data, const u8 *data, size_t size, const char *fmt, va_list args) {
+            if (fmt == nullptr) return;
+
+            // This fast path inspects only the caller's format, never shared logger state.
+            if (!IsAllowedDiagnosticMessage(fmt)) {
+                return;
+            }
+
+            // Serialize state checks, formatting, sequence assignment and synchronous I/O.
+            std::scoped_lock lk(g_log_mutex);
+            if (!g_initialized || level > g_log_level) return;
+
+            // Use shared scratch buffers instead of consuming the caller's tiny stack.
+            const int message_len = std::vsnprintf(g_message, sizeof(g_message), fmt, args);
+            if (message_len < 0) return;
+
+            size_t used = std::min(static_cast<size_t>(message_len), sizeof(g_message) - 1);
+            if (has_data) {
+                used = AppendHexLocked(used, data, size);
+            }
+
+            // Keep the runtime log output focused on the requested diagnosis channels.
+            if (!IsAllowedDiagnosticMessage(g_message)) {
+                return;
+            }
+
+            const u64 tick = os::GetSystemTick().GetInt64Value();
+            ++g_log_sequence;
+            const int len = std::snprintf(
+                g_line,
+                sizeof(g_line),
+                "[#%06llu][%016llX] %s\n",
+                static_cast<unsigned long long>(g_log_sequence),
+                static_cast<unsigned long long>(tick),
+                g_message
+            );
+            if (len <= 0) return;
+
+            // snprintf returns the required length, not the stored length. Never write
+            // beyond the buffer or include its NUL; retain a newline even if truncated.
+            const size_t written = static_cast<size_t>(len) < sizeof(g_line)
+                ? static_cast<size_t>(len) : sizeof(g_line) - 1;
+            g_line[written - 1] = '\n';
+            WriteRaw(g_line, written);
+        }
+
+    }
+
     void Switch2DebugLog(Switch2LogLevel level, const char *fmt, ...) {
-        if (level > g_log_level) return;
-
-        char buf[512];
-        u64 tick = os::GetSystemTick().GetInt64Value();
-        ++g_log_sequence;
-
-        // Format the user message
-        char msg[400];
         va_list args;
         va_start(args, fmt);
-        std::vsnprintf(msg, sizeof(msg), fmt, args);
+        LogImpl(level, false, nullptr, 0, fmt, args);
         va_end(args);
-
-        int len = std::snprintf(
-            buf,
-            sizeof(buf),
-            "[#%06llu][%016llX] %s\n",
-            static_cast<unsigned long long>(g_log_sequence),
-            static_cast<unsigned long long>(tick),
-            msg
-        );
-        if (len <= 0) return;
-
-        std::scoped_lock lk(g_log_mutex);
-        WriteRaw(buf, static_cast<size_t>(len));
     }
 
-    void Switch2DebugLogReport(PacketDirection dir, const bluetooth::Address &addr,
-                               const u8 *data, size_t size) {
-        if (Switch2LogLevel::Verbose > g_log_level) return;
-
-        char addrStr[20];
-        FormatAddress(addrStr, sizeof(addrStr), addr);
-
-        u64 tick = os::GetSystemTick().GetInt64Value();
-        ++g_log_sequence;
-
-        // Build hex string (cap at 64 bytes to keep log manageable)
-        char hexbuf[256];
-        size_t printSize = size > 64 ? 64 : size;
-        size_t pos = 0;
-        for (size_t i = 0; i < printSize && pos + 3 < sizeof(hexbuf); ++i) {
-            pos += std::snprintf(hexbuf + pos, sizeof(hexbuf) - pos, "%02X ", data[i]);
-        }
-        if (size > 64) {
-            std::snprintf(hexbuf + pos, sizeof(hexbuf) - pos, "...(+%zu)", size - 64);
-        }
-
-        char line[512];
-        int len = std::snprintf(line, sizeof(line), "[#%06llu][%016llX] [%s %s] %s\n",
-            static_cast<unsigned long long>(g_log_sequence),
-            static_cast<unsigned long long>(tick),
-            dir == PacketDirection::In ? "IN " : "OUT",
-            addrStr, hexbuf);
-        if (len <= 0) return;
-
-        std::scoped_lock lk(g_log_mutex);
-        WriteRaw(line, static_cast<size_t>(len));
-    }
-
-    void Switch2DebugLogBtEvent(const char *event, const bluetooth::Address &addr) {
-        char addrStr[20];
-        FormatAddress(addrStr, sizeof(addrStr), addr);
-        SW2_LOG_INFO("BT Event: %s addr=%s", event, addrStr);
+    void Switch2DebugLogData(Switch2LogLevel level, const void *data, size_t size, const char *fmt, ...) {
+        va_list args;
+        va_start(args, fmt);
+        LogImpl(level, true, static_cast<const u8 *>(data), size, fmt, args);
+        va_end(args);
     }
 
 }

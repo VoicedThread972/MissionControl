@@ -312,7 +312,7 @@ namespace ams::controller {
         return false;
     }
 
-    void AttachHandler(bluetooth::Address address) {
+    Result AttachHandler(bluetooth::Address address) {
         bluetooth::DevicesSettings device_settings;
         Result r = btdrvGetPairedDeviceInfo(address, &device_settings);
 
@@ -472,24 +472,43 @@ namespace ams::controller {
             id.vid,
             id.pid
         );
+        if (is_switch2_handler) {
+            SW2_LOG_INFO("[S3][OK][HANDLER-SELECT] mac=%s vid=0x%04X pid=0x%04X paired_info=" SW2_RC_FMT,
+                addr_str, id.vid, id.pid, SW2_RC_ARGS(r));
+        } else if (GetDiscoveredSwitch2ControllerType(address) != ControllerType_Unknown) {
+            SW2_LOG_WARN("[S3][FAIL][HANDLER-SELECT] mac=%s discovered as Switch 2 but generic handler chosen vid=0x%04X pid=0x%04X paired_info=" SW2_RC_FMT,
+                addr_str, id.vid, id.pid, SW2_RC_ARGS(r));
+        }
 
         {
             std::scoped_lock lk(g_controller_lock);
+            for (const auto &existing : g_controllers) {
+                if (utils::BluetoothAddressCompare(existing->Address(), address)) {
+                    if (is_switch2_handler) {
+                        SW2_LOG_WARN("[S3][FAIL][HANDLER-ATTACH] mac=%s handler already exists (stale handler not removed?)", addr_str);
+                    }
+                    return switch2::MakeResultValue(switch2::Error::DuplicateHandler);
+                }
+            }
             g_controllers.push_back(controller);
         }
 
-        if (R_FAILED(controller->Initialize())) {
+        const Result initialize_result = controller->Initialize();
+        if (R_FAILED(initialize_result)) {
             if (is_switch2_handler) {
-                // Switch 2 currently receives input through BLE GATT notify routing,
-                // not classic HID report channels. Keep the handler alive so BLE
-                // notifications can still be decoded.
-                SW2_LOG_WARN("Switch2 handler init failed on classic HID path; keeping BLE handler active");
+                // Remove only this instance, not a replacement after reconnect.
+                std::scoped_lock lk(g_controller_lock);
+                for (auto it = g_controllers.begin(); it != g_controllers.end(); ++it) {
+                    if (*it == controller) { g_controllers.erase(it); break; }
+                }
+                SW2_LOG_WARN("[S4][FAIL][HANDLER-INIT] mac=%s " SW2_RC_FMT " (handler removed)", addr_str, SW2_RC_ARGS(initialize_result));
             } else {
                 SW2_LOG_WARN("Controller init failed for addr=%s; closing HID connection", addr_str);
                 // Try to disconnect the controller
                 btdrvCloseHidConnection(controller->Address());
             }
         }
+        R_RETURN(initialize_result);
     }
 
     void RemoveHandler(bluetooth::Address address) {

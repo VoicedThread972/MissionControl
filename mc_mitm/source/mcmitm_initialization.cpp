@@ -29,6 +29,7 @@
 #include "bluetooth_mitm/bluetooth/bluetooth_ble.hpp"
 #include "usb/mc_usb_handler.hpp"
 #include "controllers/switch2_debug.hpp"
+#include "mcmitm_version.hpp"
 
 namespace ams::mitm {
 
@@ -70,28 +71,36 @@ namespace ams::mitm {
             // Initialize Switch 2 debug logging early so startup/event diagnostics
             // are available on SD for field testing.
             ams::controller::Switch2DebugInit(ams::controller::Switch2LogLevel::Verbose);
-            SW2_LOG_INFO("InitThread start (build=%s)", __DATE__ " " __TIME__);
+            SW2_LOG_INFO("[S0][START] build=%s hos=0x%08X", ams::mc::mc_build_name, static_cast<u32>(hos::GetVersion()));
+            {
+                const auto *start_config = GetGlobalConfig();
+                if (start_config->bluetooth.enable_switch2_experimental) {
+                    SW2_LOG_INFO("[S0][CONFIG] enable_switch2_experimental=1");
+                } else {
+                    SW2_LOG_WARN("[S0][CONFIG] enable_switch2_experimental=0: Switch 2 BLE path disabled, no [S1]-[S5] lines will follow");
+                }
+            }
 
             // Start async worker thread(s)
             R_ABORT_UNLESS(ams::async::Initialize());
-            SW2_LOG_INFO("Async worker initialized");
+            SW2_LOG_INFO("[S0] Async worker initialized");
 
             // Start bluetooth event handling thread
             R_ABORT_UNLESS(ams::bluetooth::events::Initialize());
-            SW2_LOG_INFO("Bluetooth event thread initialized");
+            SW2_LOG_INFO("[S0] Bluetooth event thread initialized");
 
             // Start hid report handling thread
             R_ABORT_UNLESS(ams::bluetooth::hid::report::Initialize());
-            SW2_LOG_INFO("HID report thread initialized");
+            SW2_LOG_INFO("[S0] HID report thread initialized");
 
             // Wait for system to call BluetoothEnable
-            SW2_LOG_INFO("Waiting for BluetoothEnable");
+            SW2_LOG_INFO("[S0] Waiting for BluetoothEnable");
             ams::bluetooth::core::WaitEnabled();
-            SW2_LOG_INFO("BluetoothEnable observed");
+            SW2_LOG_INFO("[S0] BluetoothEnable observed");
 
             // Connect to btdrv service now that we're sure the mitm is up and running
             R_ABORT_UNLESS(btdrvInitialize());
-            SW2_LOG_INFO("btdrvInitialize succeeded");
+            SW2_LOG_INFO("[S0] btdrvInitialize succeeded");
 
             // Get global module settings
             auto config = GetGlobalConfig();
@@ -117,7 +126,7 @@ namespace ams::mitm {
                 SW2_LOG_INFO("Applied host name override: %s", config->bluetooth.host_name);
             }
 
-            SW2_LOG_INFO("InitThread complete");
+            SW2_LOG_INFO("[S0] InitThread complete");
             g_init_event.Signal();
         }
 

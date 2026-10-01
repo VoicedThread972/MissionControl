@@ -97,7 +97,7 @@ namespace ams::controller {
     bool IsAllowedDeviceClass(const bluetooth::DeviceClass *cod);
     bool IsOfficialSwitchControllerName(const std::string& name);
 
-    void AttachHandler(bluetooth::Address address);
+    Result AttachHandler(bluetooth::Address address);
     void RemoveHandler(bluetooth::Address address);
     std::shared_ptr<SwitchController> LocateHandler(bluetooth::Address address);
 

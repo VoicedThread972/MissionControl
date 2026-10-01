@@ -132,11 +132,11 @@ namespace ams::controller {
     }
 
     Result SwitchController::WriteDataReport(const bluetooth::HidReport *report) {
-        u32 conn_id = 0;
-        if (bluetooth::ble::HasSwitch2GattConnection(m_address, &conn_id)) {
+        // A disconnected Switch 2 must fail rather than fall through to classic HID.
+        if (m_id.vid == 0x057e && (m_id.pid == 0x2060 || m_id.pid == 0x2061 || m_id.pid == 0x2062 || m_id.pid == 0x2064)) {
             const Result rc = bluetooth::ble::WriteSwitch2GattDataReport(m_address, report);
             if (R_FAILED(rc)) {
-                SW2_LOG_WARN("WriteDataReport BLE path failed rc=0x%08X size=%u", static_cast<u32>(rc.GetValue()), report->size);
+                SW2_LOG_WARN("[S4][FAIL][WRITE-PATH] BLE command path " SW2_RC_FMT " size=%u", SW2_RC_ARGS(rc), report->size);
             }
             R_RETURN(rc);
         }
