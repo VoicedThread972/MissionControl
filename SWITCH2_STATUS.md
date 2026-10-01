@@ -70,18 +70,37 @@ Sources checked:
 - Bounds discovery/connection queues, includes full firmware patches and boot
   flag in distribution, and explicitly labels artifacts experimental.
 
+## Pairing-mode recognition (minimum path, unverified on hardware)
+
+- **Product IDs corrected** to the documented/SDL values: Joy-Con 2 R `0x2066`,
+  Joy-Con 2 L `0x2067`, Pro Controller 2 `0x2069`, NSO GameCube `0x2073`
+  (VID `0x057E`). Earlier builds used `0x2060..0x2064` and could never match
+  a real advertisement.
+- **Active scan in Change Grip/Order:** classic `InquiryStatus` core events mark
+  Horizon's pairing screen. Each start opens/extends a 30 s window in which a
+  worker calls `btmStartBleScanForGeneral` with the manufacturer filter
+  `53 05 01 00 03 7E 05 <PID>` and rotates the four PIDs every 1.5 s. Results
+  go through the existing S2/S3 path (connect, GATT, bootstrap).
+- **Horizon registration via HDLS:** after a successful bootstrap the controller
+  is attached as a `hid:dbg` HDLS virtual pad (Pro = FullKey, Joy-Con L/R =
+  single Joy-Con) and input is pushed as HDLS state. This is the approach used
+  by sys-con; it is **not** a native Horizon bond:
+  - no entry in Horizon's pairing database (no persistence across reboots);
+  - no console wake, no rumble, no motion/NFC; SL/SR are probably masked;
+  - the controller must be re-synced on the Change Grip/Order screen each time.
+  - Stick scaling uses an approximate ±1600 range, not calibration data.
+
 ## Remaining implementation blockers
 
-1. **Horizon registration:** current btm MITM only renames real device lists.
-   It does not synthesize Switch 2 connected-device entries/change events. A
-   safe HID open/close event queue and related btdrv control interception are
-   absent. The old `SignalFakeEvent` helper is not safe for concurrent producers
+1. **Native Horizon registration:** the btm MITM still only renames real device
+   lists; no Switch 2 entries/change events are synthesized. HDLS is the stopgap.
+   The old `SignalFakeEvent` helper is not safe for concurrent producers
    and is deliberately NOT used as a shortcut. Unknown BTM structure fields
    must not be filled by unsupported guesses.
-2. **Scan acquisition:** the bridge passively observes btm-managed scans. Those
-   filters may never expose company 0553 advertisements. A supported, scoped
-   pairing-screen scan/filter lifecycle is still required. This build does not
-   disable/restart global filters (previous experiments correlated with crashes).
+2. **Scan acquisition:** it is unverified whether btm accepts a general BLE scan
+   while inquiry runs and whether `btmBleConnect` works for these devices.
+   Outside the pairing screen the bridge only observes btm-managed scans.
+   Global filters are not disabled/restarted (earlier experiments crashed).
 3. **GATT hardware sequencing:** verify service cache timing, UUID representation,
    CCC write completion and the ordering/meaning of driver events on target
    firmware. IPC success alone is not proof that a remote subscription completed.
@@ -133,17 +152,18 @@ alternatively remove the module's `flags/boot2.flag` to disable its startup.
 
 ## Reading the diagnostic log
 
-`config/MissionControl/switch2_debug.log` (format version 3) contains only lines
+`config/MissionControl/switch2_debug.log` (format version 4) contains only lines
 tagged with a protocol stage. Every line has a sequence number and system tick.
 
 | Stage | Covers | Key lines |
 |---|---|---|
 | S0 | session/startup/config | `[S0][START] build= hos=`, `[S0][CONFIG] enable_switch2_experimental=` |
-| S1 | BLE scan and other BLE events | `SCAN-MAC` (first 32), `SCAN-SUMMARY`, `BLE-EVENT ClientConfigureMtu mtu=` |
+| S1 | pairing mode, BLE scan, other BLE events | `PAIRING-MODE`, `SCAN-ACTIVE-START`, `SCAN-ACTIVE-FILTER pid=`, `FAIL][SCAN-ACTIVE`, `SCAN-ACTIVE-STOP`, `SCAN-MAC` (first 32), `SCAN-SUMMARY`, `BLE-EVENT ClientConfigureMtu mtu=` |
 | S2 | advertisement identification | `[OK][FOUND-nn] type=`, `[SKIP][ADV-0553]` (Nintendo data, unknown layout/PID) |
 | S3 | connect and GATT setup | `CONNECT-REQUEST`, `CONNECTED`, `GATT-SERVICE-LOOKUP`, `GATT-<RESP/INPUT>-<CHAR/CCC-DESC/NOTIFY-REG/CCC-WRITE>`, `HANDLER-SELECT`, `GATT-SETUP`, `DISCONNECTED` |
 | S4 | command bootstrap | `PAIR-nn`, `CMD-TX` (hex), `CMD-RX` (hex), `CMD-ACK ack= elapsed_ms=`, `DROP][CMD-RX result=` |
 | S5 | input | `INPUT-FIRST` (hex), `INPUT-CHANGE buttons=`, `DROP][<reason>`, `STATS` |
+| S6 | Horizon HDLS bridge | `HDLS-QUEUE type=`, `HDLS-INIT`, `HDLS-ATTACH type=`, `FAIL][HDLS-STATE`, `HDLS-DETACH` |
 
 Result tags: `[OK]`, `[FAIL]`, `[DROP]` (packet discarded), `[SKIP]` (expected,
 not an error), `[STATS]` (per-connection counters written on disconnect).
@@ -153,6 +173,8 @@ Result codes are printed as `rc=0xXXXXXXXX(name)`; module 0x123 names are
 How to locate the failure:
 
 1. Check `[S0][CONFIG]`. If the experimental path is off, nothing else appears.
+   Opening Change Grip/Order must produce `[S1][PAIRING-MODE]` and
+   `[S1][OK][SCAN-ACTIVE-START]`; if not, inquiry events were not observed.
 2. Find the **first** `[FAIL]` line; later failures are usually consequences.
    `[S3][FAIL][GATT-SETUP]` is a summary; the step-specific `[FAIL]` precedes it.
 3. If there is no `[FAIL]`, the last stage reached is the failure point:
@@ -160,9 +182,9 @@ How to locate the failure:
    `ADV-0553`); S2 without `CONNECTED` = connect not completed; `CMD-TX` without
    `CMD-RX` = controller did not answer (`ack-timeout`); `CMD-RX` with
    `[DROP]` = response did not match the awaited command.
-4. `[S5][OK][INPUT-FIRST]` proves that a notification was decoded and written to
-   the HID event buffer. It does **not** prove Horizon accepts the controller
-   (device registration is not implemented).
+4. `[S5][OK][INPUT-FIRST]` proves that a notification was decoded.
+   `[S6][OK][HDLS-ATTACH]` means hid accepted the virtual pad; it should then
+   appear on the Change Grip/Order screen (press L+R / SL+SR to confirm).
 5. `[S5][STATS]` on disconnect: `notifications` vs. `delivered` and the per-reason
    drop counters show where input packets were lost. A `CCC-WRITE` OK only means
    the request was queued; the first notification proves delivery.

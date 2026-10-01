@@ -533,6 +533,129 @@ namespace ams::bluetooth::ble {
             g_switch2_connect_worker_started = true;
         }
 
+        // --- Active BLE scan while Horizon is in controller pairing mode ---
+        //
+        // Nothing in Horizon scans for Switch 2 advertisements, so the passive
+        // observer in HandleScanResultEvent never sees them. While "Change
+        // Grip/Order" runs classic inquiry (InquiryStatus started events), ask btm
+        // for a general BLE scan. btm builds one manufacturer filter per call:
+        // company id + 0x01 + 6 pattern bytes (switchbrew BTM services), i.e. it
+        // matches "53 05 | 01 | 00 03 7E 05 PID_lo PID_hi" from the documented
+        // advertisement. One PID per filter, so the worker rotates the PIDs.
+        constexpr u64 PairingScanWindowNs = 30'000'000'000ull;
+        constexpr u32 PairingScanRotateMs = 1500;
+        constexpr u16 PairingScanPids[] = { sw2::PidJoyConL, sw2::PidJoyConR, sw2::PidPro, sw2::PidNsoGc };
+        constexpr u32 MaxScanStartFailureLogs = 8;
+
+        constinit os::SdkMutex g_pairing_scan_lock;
+        constinit u64 g_pairing_scan_until_ns = 0;   // Guarded by g_pairing_scan_lock.
+        os::Event g_pairing_scan_event(os::EventClearMode_AutoClear);
+
+        constexpr s32 Switch2ScanWorkerThreadPriority = 19;
+        constexpr size_t Switch2ScanWorkerThreadStackSize = 0x2000;
+        alignas(os::ThreadStackAlignment) constinit u8 g_switch2_scan_worker_thread_stack[Switch2ScanWorkerThreadStackSize];
+        constinit os::ThreadType g_switch2_scan_worker_thread;
+        constinit bool g_switch2_scan_worker_started = false;
+
+        bool IsPairingScanWindowOpen() {
+            std::scoped_lock lk(g_pairing_scan_lock);
+            return GetCurrentTimeNs() < g_pairing_scan_until_ns;
+        }
+
+        void Switch2ScanWorkerThreadFunc(void *) {
+            bool scanning = false;
+            bool btm_open = false;
+            size_t pid_index = 0;
+            u32 cycles = 0;
+            u32 start_failures = 0;
+
+            for (;;) {
+                if (scanning) {
+                    g_pairing_scan_event.TimedWait(ams::TimeSpan::FromMilliSeconds(PairingScanRotateMs));
+                } else {
+                    g_pairing_scan_event.Wait();
+                }
+
+                if (!IsPairingScanWindowOpen()) {
+                    if (scanning) {
+                        const Result rc = btmStopBleScanForGeneral();
+                        SW2_LOG_INFO("[S1][SCAN-ACTIVE-STOP] pairing window closed after %u filter rotations " SW2_RC_FMT, cycles, SW2_RC_ARGS(rc));
+                        scanning = false;
+                    }
+                    if (btm_open) {
+                        btmExit();
+                        btm_open = false;
+                    }
+                    continue;
+                }
+
+                if (!btm_open) {
+                    const Result rc = btmInitialize();
+                    if (R_FAILED(rc)) {
+                        SW2_LOG_WARN("[S1][FAIL][SCAN-ACTIVE] btmInitialize " SW2_RC_FMT, SW2_RC_ARGS(rc));
+                        continue;
+                    }
+                    btm_open = true;
+                    cycles = 0;
+                    start_failures = 0;
+                    SW2_LOG_INFO("[S1][OK][SCAN-ACTIVE-START] Horizon pairing mode detected; scanning for Switch 2 advertisements (press SYNC on the controller)");
+                }
+
+                if (scanning) {
+                    static_cast<void>(btmStopBleScanForGeneral());
+                    scanning = false;
+                }
+
+                const u16 pid = PairingScanPids[pid_index];
+                pid_index = (pid_index + 1) % std::size(PairingScanPids);
+
+                BtdrvBleAdvertisePacketParameter param = {};
+                param.company_id = 0x0553;
+                param.pattern_data[0] = 0x00;
+                param.pattern_data[1] = 0x03;
+                param.pattern_data[2] = static_cast<u8>(sw2::VendorId & 0xFF);
+                param.pattern_data[3] = static_cast<u8>(sw2::VendorId >> 8);
+                param.pattern_data[4] = static_cast<u8>(pid & 0xFF);
+                param.pattern_data[5] = static_cast<u8>(pid >> 8);
+
+                const Result rc = btmStartBleScanForGeneral(param);
+                if (R_FAILED(rc)) {
+                    if (++start_failures <= MaxScanStartFailureLogs) {
+                        SW2_LOG_WARN("[S1][FAIL][SCAN-ACTIVE] btmStartBleScanForGeneral pid=0x%04X " SW2_RC_FMT, pid, SW2_RC_ARGS(rc));
+                    }
+                    // Keep rotating; TimedWait paces retries.
+                    scanning = true;
+                    continue;
+                }
+
+                scanning = true;
+                if (cycles < std::size(PairingScanPids)) {
+                    SW2_LOG_VERBOSE("[S1][OK][SCAN-ACTIVE-FILTER] pid=0x%04X filter=53 05 01 00 03 7E 05 %02X %02X",
+                        pid, pid & 0xFF, pid >> 8);
+                }
+                ++cycles;
+            }
+        }
+
+        void StartSwitch2ScanWorkerIfNeeded() {
+            if (g_switch2_scan_worker_started) {
+                return;
+            }
+
+            R_ABORT_UNLESS(os::CreateThread(
+                &g_switch2_scan_worker_thread,
+                Switch2ScanWorkerThreadFunc,
+                nullptr,
+                g_switch2_scan_worker_thread_stack,
+                Switch2ScanWorkerThreadStackSize,
+                Switch2ScanWorkerThreadPriority
+            ));
+
+            os::SetThreadNamePointer(&g_switch2_scan_worker_thread, "mc::Sw2ScanWorker");
+            os::StartThread(&g_switch2_scan_worker_thread);
+            g_switch2_scan_worker_started = true;
+        }
+
         void ResetSwitch2CommandState(u32 conn_id) {
             std::scoped_lock lk(g_switch2_cmd_response_lock);
             g_switch2_cmd_responses[conn_id] = {};
@@ -751,10 +874,10 @@ namespace ams::bluetooth::ble {
         constexpr u8 Switch2ManufacturerPrefix[] = { 0x01, 0x00, 0x03 };
 
         constexpr size_t Switch2ManufacturerMinSize = 9;
-        constexpr u16 Switch2PidJoyConL = 0x2060;
-        constexpr u16 Switch2PidJoyConR = 0x2061;
-        constexpr u16 Switch2PidPro = 0x2062;
-        constexpr u16 Switch2PidNsoGc = 0x2064;
+        constexpr u16 Switch2PidJoyConL = sw2::PidJoyConL;
+        constexpr u16 Switch2PidJoyConR = sw2::PidJoyConR;
+        constexpr u16 Switch2PidPro = sw2::PidPro;
+        constexpr u16 Switch2PidNsoGc = sw2::PidNsoGc;
 
         bool MatchSwitch2ManufacturerData(const auto &ad) {
             if (ad.type != 0xFF || ad.size < Switch2ManufacturerMinSize) {
@@ -1106,7 +1229,7 @@ namespace ams::bluetooth::ble {
             const Result rc = device->HandleDataReportEvent(&event_info);
             if (R_FAILED(rc)) {
                 if (CountNotifyDrop(cn.conn_id, NotifyDrop_HandlerError)) {
-                    SW2_LOG_WARN("[S5][DROP][%s] conn_id=%u report=0x%02X forwarding to HID event buffer failed " SW2_RC_FMT " (first only)",
+                    SW2_LOG_WARN("[S5][DROP][%s] conn_id=%u report=0x%02X input handler failed " SW2_RC_FMT " (first only)",
                         NotifyDropNames[NotifyDrop_HandlerError], cn.conn_id, report_id, SW2_RC_ARGS(rc));
                 }
                 return;
@@ -1124,7 +1247,7 @@ namespace ams::bluetooth::ble {
                 }
             }
             if (log_first) {
-                SW2_LOG_DATA_INFO(cn.data, cn.size, "[S5][OK][INPUT-FIRST] conn_id=%u report=0x%02X forwarded to HID event buffer (Horizon registration not verified)",
+                SW2_LOG_DATA_INFO(cn.data, cn.size, "[S5][OK][INPUT-FIRST] conn_id=%u report=0x%02X decoded and queued for the HDLS virtual pad (see [S6])",
                     cn.conn_id, report_id);
             } else if (delivered != 0 && (delivered % InputAliveLogInterval) == 0) {
                 SW2_LOG_VERBOSE("[S5][INPUT-ALIVE] conn_id=%u delivered=%u", cn.conn_id, delivered);
@@ -1178,7 +1301,35 @@ namespace ams::bluetooth::ble {
 
     void SignalInitialized() {
         g_init_event.Signal();
-        if (ams::mitm::GetGlobalConfig()->bluetooth.enable_switch2_experimental) StartSwitch2ConnectWorkerIfNeeded();
+        if (ams::mitm::GetGlobalConfig()->bluetooth.enable_switch2_experimental) {
+            StartSwitch2ConnectWorkerIfNeeded();
+            StartSwitch2ScanWorkerIfNeeded();
+        }
+    }
+
+    void NotifyHorizonInquiryStatus(bool started) {
+        if (!ams::mitm::GetGlobalConfig()->bluetooth.enable_switch2_experimental) {
+            return;
+        }
+
+        bool opened = false;
+        {
+            std::scoped_lock lk(g_pairing_scan_lock);
+            const u64 now_ns = GetCurrentTimeNs();
+            if (started) {
+                opened = now_ns >= g_pairing_scan_until_ns;
+                // Change Grip/Order restarts inquiry in cycles; each start extends the window.
+                g_pairing_scan_until_ns = now_ns + PairingScanWindowNs;
+            }
+        }
+
+        if (opened) {
+            SW2_LOG_INFO("[S1][PAIRING-MODE] Horizon inquiry started; opening Switch 2 BLE scan window (%u s)",
+                static_cast<u32>(PairingScanWindowNs / 1'000'000'000ull));
+        } else {
+            SW2_LOG_VERBOSE("[S1][PAIRING-MODE] Horizon inquiry %s", started ? "restarted (window extended)" : "stopped");
+        }
+        g_pairing_scan_event.Signal();
     }
 
     void WaitInitialized() {

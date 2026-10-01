@@ -14,6 +14,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "bluetooth_core.hpp"
+#include "bluetooth_ble.hpp"
 #include "../btdrv_ext.h"
 #include "../btdrv_mitm_flags.hpp"
 #include "../../controllers/controller_management.hpp"
@@ -285,6 +286,13 @@ namespace ams::bluetooth::core {
 
         SW2_LOG_INFO("Core Event: type=%u (%s)", (u32)g_current_event_type, GetCoreEventTypeName(g_current_event_type));
         LogCoreEventSummary(g_current_event_type, g_event_info);
+
+        // Classic inquiry runs while Horizon's Change Grip/Order screen is open.
+        if (hos::GetVersion() >= hos::Version_12_0_0 && g_current_event_type == BtdrvEventType_InquiryStatus) {
+            ble::NotifyHorizonInquiryStatus(g_event_info.inquiry_status.v12.status == BtdrvInquiryStatus_Started);
+        } else if (hos::GetVersion() < hos::Version_12_0_0 && static_cast<u32>(g_current_event_type) == BtdrvEventTypeOld_InquiryStatus) {
+            ble::NotifyHorizonInquiryStatus(g_event_info.inquiry_status.v1.status == BtdrvInquiryStatus_Started);
+        }
 
         // Process custom event and return
         if (g_current_event_type == BtdrvEventType_MissionControlCustomEvent) {

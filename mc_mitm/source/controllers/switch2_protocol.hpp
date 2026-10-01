@@ -5,16 +5,29 @@
 
 namespace ams::controller::switch2 {
 
+    // Nintendo vendor id and Switch 2 product ids. Source: SDL usb_ids.h, the
+    // USB descriptors in documentation/descriptors.md and the advertisement
+    // example in documentation/bluetooth_interface.md ("7e 05 69 20" = Pro).
+    constexpr std::uint16_t VendorId   = 0x057E;
+    constexpr std::uint16_t PidJoyConR = 0x2066;
+    constexpr std::uint16_t PidJoyConL = 0x2067;
+    constexpr std::uint16_t PidPro     = 0x2069;
+    constexpr std::uint16_t PidNsoGc   = 0x2073;
+
     // BLE omits the report ID. The bridge must restore it from the characteristic
     // UUID, never guess it from payload length (all formats can be 63 bytes).
     constexpr std::uint8_t DefaultReportId(std::uint16_t pid) {
         switch (pid) {
-            case 0x2060: return 0x07;
-            case 0x2061: return 0x08;
-            case 0x2062: return 0x09;
-            case 0x2064: return 0x0A;
+            case PidJoyConL: return 0x07;
+            case PidJoyConR: return 0x08;
+            case PidPro:     return 0x09;
+            case PidNsoGc:   return 0x0A;
             default: return 0;
         }
+    }
+
+    constexpr bool IsSwitch2Pid(std::uint16_t pid) {
+        return DefaultReportId(pid) != 0;
     }
 
     constexpr std::size_t MinimumPayloadSize(std::uint8_t report_id) {

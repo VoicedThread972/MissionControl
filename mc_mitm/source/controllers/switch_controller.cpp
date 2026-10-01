@@ -17,6 +17,7 @@
 #include "../mcmitm_config.hpp"
 #include "../bluetooth_mitm/bluetooth/bluetooth_ble.hpp"
 #include "switch2_debug.hpp"
+#include "switch2_protocol.hpp"
 #include <string>
 
 namespace ams::controller {
@@ -133,7 +134,7 @@ namespace ams::controller {
 
     Result SwitchController::WriteDataReport(const bluetooth::HidReport *report) {
         // A disconnected Switch 2 must fail rather than fall through to classic HID.
-        if (m_id.vid == 0x057e && (m_id.pid == 0x2060 || m_id.pid == 0x2061 || m_id.pid == 0x2062 || m_id.pid == 0x2064)) {
+        if (m_id.vid == switch2::VendorId && switch2::IsSwitch2Pid(m_id.pid)) {
             const Result rc = bluetooth::ble::WriteSwitch2GattDataReport(m_address, report);
             if (R_FAILED(rc)) {
                 SW2_LOG_WARN("[S4][FAIL][WRITE-PATH] BLE command path " SW2_RC_FMT " size=%u", SW2_RC_ARGS(rc), report->size);

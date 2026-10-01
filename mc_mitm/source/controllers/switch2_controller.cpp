@@ -16,6 +16,7 @@
 #include "switch2_controller.hpp"
 #include "controller_utils.hpp"
 #include "switch2_debug.hpp"
+#include "switch2_hdls.hpp"
 #include "switch2_protocol.hpp"
 #include <stratosphere.hpp>
 
@@ -46,9 +47,79 @@ namespace ams::controller {
             return 8;
         }
 
+        // Approximate usable deflection of the 12-bit sticks around 0x800. Values
+        // beyond it are clamped; factory calibration is not read yet.
+        constexpr s32 StickDeflection = 1600;
+
+        s32 convert_stick_axis(u16 raw) {
+            const s32 value = (static_cast<s32>(raw) - static_cast<s32>(SwitchAnalogStick::Center)) * JOYSTICK_MAX / StickDeflection;
+            return std::clamp<s32>(value, -JOYSTICK_MAX, JOYSTICK_MAX);
+        }
+
+        switch2_hdls::PadKind pad_kind_from_pid(u16 pid) {
+            switch (pid) {
+                case switch2::PidJoyConL: return switch2_hdls::PadKind::JoyConLeft;
+                case switch2::PidJoyConR: return switch2_hdls::PadKind::JoyConRight;
+                default:                  return switch2_hdls::PadKind::FullKey;
+            }
+        }
+
     }
 
     // --- Switch2Controller base ---
+
+    Switch2Controller::~Switch2Controller() {
+        switch2_hdls::Detach(this);
+    }
+
+    Result Switch2Controller::HandleDataReportEvent(const bluetooth::HidReportEventInfo *event_info) {
+        // The BLE bridge always fills the v9 layout.
+        HiddbgHdlsState state;
+        {
+            std::scoped_lock lk(m_input_mutex);
+            this->ProcessInputData(&event_info->data_report.v9.report);
+            this->BuildHdlsState(&state);
+        }
+        switch2_hdls::Update(this, state);
+        R_SUCCEED();
+    }
+
+    void Switch2Controller::BuildHdlsState(HiddbgHdlsState *out) {
+        *out = {};
+        out->battery_level = std::min<u32>(m_battery / 2, 4);
+        out->flags = (m_ext_power ? BIT(0) : 0) | (m_charging ? BIT(1) : 0);
+
+        u64 b = 0;
+        if (m_buttons.A)            b |= HidNpadButton_A;
+        if (m_buttons.B)            b |= HidNpadButton_B;
+        if (m_buttons.X)            b |= HidNpadButton_X;
+        if (m_buttons.Y)            b |= HidNpadButton_Y;
+        if (m_buttons.lstick_press) b |= HidNpadButton_StickL;
+        if (m_buttons.rstick_press) b |= HidNpadButton_StickR;
+        if (m_buttons.L)            b |= HidNpadButton_L;
+        if (m_buttons.R)            b |= HidNpadButton_R;
+        if (m_buttons.ZL)           b |= HidNpadButton_ZL;
+        if (m_buttons.ZR)           b |= HidNpadButton_ZR;
+        if (m_buttons.plus)         b |= HidNpadButton_Plus;
+        if (m_buttons.minus)        b |= HidNpadButton_Minus;
+        if (m_buttons.dpad_left)    b |= HidNpadButton_Left;
+        if (m_buttons.dpad_up)      b |= HidNpadButton_Up;
+        if (m_buttons.dpad_right)   b |= HidNpadButton_Right;
+        if (m_buttons.dpad_down)    b |= HidNpadButton_Down;
+        // hid masks bits 20-27 of HDLS input (libnx hiddbg.h), so SL/SR may be dropped.
+        if (m_buttons.SL_left)      b |= HidNpadButton_LeftSL;
+        if (m_buttons.SR_left)      b |= HidNpadButton_LeftSR;
+        if (m_buttons.SL_right)     b |= HidNpadButton_RightSL;
+        if (m_buttons.SR_right)     b |= HidNpadButton_RightSR;
+        if (m_buttons.home)         b |= HiddbgNpadButton_Home;
+        if (m_buttons.capture)      b |= HiddbgNpadButton_Capture;
+        out->buttons = b;
+
+        out->analog_stick_l.x = convert_stick_axis(m_left_stick.GetX());
+        out->analog_stick_l.y = convert_stick_axis(m_left_stick.GetY());
+        out->analog_stick_r.x = convert_stick_axis(m_right_stick.GetX());
+        out->analog_stick_r.y = convert_stick_axis(m_right_stick.GetY());
+    }
 
     void Switch2Controller::MakeSwitch2Command(bluetooth::HidReport *report, u8 cmd_id, u8 sub_id, const u8 *data, u8 data_len) {
         report->data[0] = cmd_id;
@@ -67,12 +138,12 @@ namespace ams::controller {
 
     u8 Switch2Controller::GetFeatureMask() const {
         switch (m_id.pid) {
-            case 0x2060:
-            case 0x2061:
+            case switch2::PidJoyConL:
+            case switch2::PidJoyConR:
                 return FeatureMaskJoyCon2;
-            case 0x2062:
+            case switch2::PidPro:
                 return FeatureMaskPro2;
-            case 0x2064:
+            case switch2::PidNsoGc:
                 return FeatureMaskNsoGc;
             default:
                 return FeatureMaskPro2;
@@ -137,7 +208,7 @@ namespace ams::controller {
         // Persistent bonding requires verified B1/B2, host-side key storage and
         // a supported link-encryption path; none may be replaced by replay data.
 
-        if (m_id.pid == 0x2060 || m_id.pid == 0x2061 || m_id.pid == 0x2064) {
+        if (m_id.pid == switch2::PidJoyConL || m_id.pid == switch2::PidJoyConR || m_id.pid == switch2::PidNsoGc) {
             R_TRY(send_pairing_step(
                 "Request firmware information.",
                 0x10,
@@ -198,7 +269,9 @@ namespace ams::controller {
             0
         ));
 
-        SW2_LOG_INFO("[S4][OK][GATT-INIT] command bootstrap acknowledged; not persistent bonding or Horizon registration");
+        SW2_LOG_INFO("[S4][OK][GATT-INIT] command bootstrap acknowledged; registering with Horizon via HDLS ([S6])");
+
+        switch2_hdls::Attach(this, m_address, pad_kind_from_pid(m_id.pid));
 
         R_SUCCEED();
     }
@@ -293,7 +366,7 @@ namespace ams::controller {
                                                    (report->data[Switch2InputReport0x05Offset_BatteryVoltage + 1] << 8));
             m_battery = convert_battery_voltage(voltage_mv);
         }
-        if (m_id.pid == 0x2064 && report->size > Switch2InputReport0x05Offset_TriggerR) {
+        if (m_id.pid == switch2::PidNsoGc && report->size > Switch2InputReport0x05Offset_TriggerR) {
             m_buttons.ZL |= report->data[Switch2InputReport0x05Offset_TriggerL] > Switch2TriggerThreshold;
             m_buttons.ZR |= report->data[Switch2InputReport0x05Offset_TriggerR] > Switch2TriggerThreshold;
         }

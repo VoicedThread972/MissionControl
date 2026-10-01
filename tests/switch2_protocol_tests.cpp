@@ -11,7 +11,11 @@
 
 int main() {
     using namespace ams::controller::switch2;
-    for (auto pid : {0x2060, 0x2061, 0x2062, 0x2064}) {
+    // Regression: real PIDs (SDL usb_ids.h / documentation adv example).
+    assert(DefaultReportId(0x2067) == 0x07 && DefaultReportId(0x2066) == 0x08);
+    assert(DefaultReportId(0x2069) == 0x09 && DefaultReportId(0x2073) == 0x0A);
+    assert(!IsSwitch2Pid(0x2060) && !IsSwitch2Pid(0x2009) && IsSwitch2Pid(0x2069));
+    for (auto pid : {PidJoyConL, PidJoyConR, PidPro, PidNsoGc}) {
         const auto id = DefaultReportId(pid);
         const auto minimum = MinimumPayloadSize(id);
         assert(ValidInput(id, pid, minimum));
@@ -21,9 +25,9 @@ int main() {
         assert(!ValidInput(0x05, pid, 15));
         assert(!ValidInput(id, pid, 513));
     }
-    assert(!ValidInput(0x08, 0x2060, 63));
-    assert(!ValidInput(0x07, 0x2061, 63));
-    assert(!ValidInput(0, 0x2060, 63));
+    assert(!ValidInput(0x08, PidJoyConL, 63));
+    assert(!ValidInput(0x07, PidJoyConR, 63));
+    assert(!ValidInput(0, PidJoyConL, 63));
     assert(!ValidInput(0x05, 0, 63));
     const std::uint8_t center[] = {0x00, 0x08, 0x80};
     const std::uint8_t maximum[] = {0xff, 0xff, 0xff};

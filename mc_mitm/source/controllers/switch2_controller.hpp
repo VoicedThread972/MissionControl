@@ -100,7 +100,15 @@ namespace ams::controller {
             Switch2Controller(bluetooth::Address address, HardwareID id)
             : EmulatedSwitchController(address, id) { }
 
+            // Removes the Horizon virtual pad registered by Initialize().
+            virtual ~Switch2Controller();
+
             Result Initialize() override;
+
+            // Decodes the BLE input and forwards it to the HDLS virtual pad. The
+            // classic HID report buffer is not written: Horizon has no classic
+            // HID connection for this address.
+            Result HandleDataReportEvent(const bluetooth::HidReportEventInfo *event_info) override;
 
             void ProcessInputData(const bluetooth::HidReport *report) override;
 
@@ -116,6 +124,7 @@ namespace ams::controller {
             u8 GetFeatureMask() const;
             void ResetSwitch2StateForReport();
             void ApplyPowerInfo(u8 power_info);
+            void BuildHdlsState(HiddbgHdlsState *out);
 
             void MapInputReport0x05(const bluetooth::HidReport *report);
             void MapInputReport0x07(const bluetooth::HidReport *report);
@@ -134,7 +143,7 @@ namespace ams::controller {
     class JoyCon2LController final : public Switch2Controller {
         public:
             static constexpr const HardwareID hardware_ids[] = {
-                {0x057e, 0x2060}
+                {switch2::VendorId, switch2::PidJoyConL}
             };
 
             JoyCon2LController(bluetooth::Address address, HardwareID id)
@@ -144,7 +153,7 @@ namespace ams::controller {
     class JoyCon2RController final : public Switch2Controller {
         public:
             static constexpr const HardwareID hardware_ids[] = {
-                {0x057e, 0x2061}
+                {switch2::VendorId, switch2::PidJoyConR}
             };
 
             JoyCon2RController(bluetooth::Address address, HardwareID id)
@@ -154,7 +163,7 @@ namespace ams::controller {
     class ProController2Controller final : public Switch2Controller {
         public:
             static constexpr const HardwareID hardware_ids[] = {
-                {0x057e, 0x2062}
+                {switch2::VendorId, switch2::PidPro}
             };
 
             ProController2Controller(bluetooth::Address address, HardwareID id)
@@ -164,7 +173,7 @@ namespace ams::controller {
     class NSOGCController2Controller final : public Switch2Controller {
         public:
             static constexpr const HardwareID hardware_ids[] = {
-                {0x057e, 0x2064}
+                {switch2::VendorId, switch2::PidNsoGc}
             };
 
             NSOGCController2Controller(bluetooth::Address address, HardwareID id)

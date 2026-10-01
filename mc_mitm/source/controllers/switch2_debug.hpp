@@ -33,6 +33,7 @@ namespace ams::controller {
     //   [S0] session/startup/config      [S1] BLE scan and raw BLE events
     //   [S2] Switch 2 identification      [S3] connection and GATT setup
     //   [S4] command protocol (TX/RX/ACK) [S5] input notifications and forwarding
+    //   [S6] Horizon registration via hid:dbg HDLS virtual devices
     // Result tags: [OK], [FAIL], [DROP], [SKIP], [STATS]. The first [FAIL] or
     // [DROP] after the last [OK] of a connection identifies the failing step.
 
@@ -43,7 +44,7 @@ namespace ams::controller {
     // Disable logging under the logger mutex; file handles are already short-lived.
     void Switch2DebugFini();
 
-    // Log only messages whose format and formatted text contain an [S0]-[S5] marker.
+    // Log only messages whose format and formatted text contain an [S0]-[S6] marker.
     // State, sequence and static scratch buffers are mutex-protected through file I/O.
     // Long messages are truncated but retain a trailing newline; callers may block on SD I/O.
     void Switch2DebugLog(Switch2LogLevel level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));

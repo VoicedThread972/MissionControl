@@ -34,4 +34,8 @@ namespace ams::bluetooth::ble {
     bool HasSwitch2GattConnection(const bluetooth::Address &address, u32 *out_conn_id);
     Result WriteSwitch2GattDataReport(const bluetooth::Address &address, const bluetooth::HidReport *report);
 
+    // Called from the core event thread on InquiryStatus events. Non-blocking:
+    // opens/extends the Switch 2 BLE scan window used during Change Grip/Order.
+    void NotifyHorizonInquiryStatus(bool started);
+
 }

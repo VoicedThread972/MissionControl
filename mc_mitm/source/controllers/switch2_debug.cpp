@@ -36,7 +36,8 @@ namespace ams::controller {
                    std::strstr(msg, "[S2]") != nullptr ||
                    std::strstr(msg, "[S3]") != nullptr ||
                    std::strstr(msg, "[S4]") != nullptr ||
-                   std::strstr(msg, "[S5]") != nullptr;
+                   std::strstr(msg, "[S5]") != nullptr ||
+                   std::strstr(msg, "[S6]") != nullptr;
         }
 
         // All mutable logger state and formatting buffers are protected by g_log_mutex.
@@ -81,8 +82,8 @@ namespace ams::controller {
             static constexpr const char kHeaderMid[] =
                 "\nSession Start Tick: ";
             static constexpr const char kHeaderSuffix[] =
-                "\nLog Format Version: 3\n"
-                "Stages: S0=session S1=ble-scan/events S2=identify S3=connect/gatt S4=commands S5=input\n";
+                "\nLog Format Version: 4\n"
+                "Stages: S0=session S1=ble-scan/events S2=identify S3=connect/gatt S4=commands S5=input S6=horizon-hdls\n";
 
             WriteRaw(kHeaderPrefix, std::strlen(kHeaderPrefix));
             WriteRaw(BuildSignature, std::strlen(BuildSignature));
